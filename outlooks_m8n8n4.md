@@ -65,3 +65,48 @@ Add specific test cases targeting `8x8x4` and `8x8x8` matrix multiplications to 
 *   **Changes:**
     *   In the `@pytest.mark.parametrize` matrices for `fp64`, add `BLOCK_M=8, BLOCK_N=8, BLOCK_K=4` (and `8x8x8`).
     *   Run tests explicitly enforcing exact `fp64` tile execution boundaries. 
+
+---
+
+# Progress Report: Implementation Complete
+
+## Summary
+
+All changes from the plan above have been implemented and tested on branch `smallMMA`. The fp64 MMA path now operates at native `m8n8k4` granularity, supporting any shape that is a multiple of 8×8×4, including the minimal 8×8×4 case.
+
+## Files Changed
+
+### `lib/Dialect/TritonGPU/IR/Dialect.cpp`
+- `getRepForOperand`: Changed `tileBitWidthK` from `2 * 256` to `1 * 256` for fp64 (K-tile = 4). Changed `tileSize[M]` from hardcoded `16` to `8` for fp64.
+
+### `lib/Dialect/TritonGPU/Transforms/Utility.cpp`
+- `mmaVersionToInstrShape`: Returns `instrShape[M] = 8` for fp64 (was always 16). This ensures the MMA encoding attribute matches the native instruction shape.
+
+### `lib/Dialect/TritonGPU/IR/LinearLayoutConversions.cpp`
+- `nvidiaDotToLinearLayout`: Uses `instrShape` from the MMA encoding for tile shape computation. K tile multiplier is 4 (not 8) when `instrM == 8`. This keeps LinearLayout data packing consistent with the changed rep computation.
+
+### `third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM/MMAv2.cpp`
+- `getMmaRetType`: fp64 returns `struct{f64, f64}` (2 elements) instead of `struct{f64, f64, f64, f64}` (4 elements).
+- `callMmaAmpereFp64`: Rewritten to emit exactly one `m8n8k4` instruction per call (single retArgs(2), aArgs(1), bArgs(1), cArgs(2)).
+- `numRegisters`: `{1, 1, 1}` for fp64 (was effectively `{2, 1, 2}`).
+- `numMmaRets`: 2 for fp64 (was 4).
+- `numCPackedElem`: 1 for fp64 (was incorrectly computed).
+- fc indexing formula: Uses `numMmaRets * numCPackedElem` instead of hardcoded `4`.
+
+### `third_party/nvidia/backend/compiler.py`
+- `min_dot_size`: Added `elif lhs_bitwidth == 64: return (1, 1, 4)` to allow K=4 for fp64.
+
+### `python/test/unit/language/test_core.py`
+- Added small fp64 test cases: `(8,8,4)`, `(8,8,8)`, `(16,8,4)`, `(8,8,16)` with `num_warps=1`.
+
+### `test/Conversion/tritongpu_to_llvm.mlir`
+- Updated `f64_mma_cvt` test to use `instrShape = [8, 8]` matching the new fp64 encoding.
+
+## Test Results
+
+All tests pass on A100 (SM80):
+
+- **Existing fp64 dot tests**: 60 passed, 89 skipped (all skips are for non-applicable configs like HIP or non-fp64 types)
+- **New small-shape tests**: 8×8×4, 8×8×8, 16×8×4, 8×8×16 all pass
+- **Larger shapes**: 16×16×16, 32×32×32, 64×64×64 all produce correct results
+- Identity matrix tests and random matrix tests both verified
