@@ -2332,8 +2332,8 @@ tt.func @gather_in_shared_dot_input(%arg0: tensor<16x4xi32, #blocked>, %arg1: te
 
   // CHECK: [[SMEM_BASE:%.*]] = llvm.mlir.addressof @global_smem
   // CHECK-NEXT: [[SMEM:%.*]] = llvm.getelementptr [[SMEM_BASE]]
-  // CHECK: store [[S0]]
-  // CHECK-NEXT: nvvm.barrier0
+  // CHECK: insertelement [[S0]]
+  // CHECK: nvvm.barrier0
 
   // CHECK: [[I0:%.*]] = llvm.extractvalue %arg0[0]
 
