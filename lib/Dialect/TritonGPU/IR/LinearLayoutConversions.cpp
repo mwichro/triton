@@ -1019,11 +1019,17 @@ LinearLayout nvidiaDotToLinearLayout(ArrayRef<int64_t> shape,
   SmallVector<unsigned> tileShape(rank, 1);
   auto instrShape = mma.getInstrShape();
   unsigned instrM = instrShape[rank - 2];
-  // FP64 stores its native K in instrShape (size > rank). Other dtypes leave
-  // K implicit at `kWidth * 8` (the standard sm_80 256-bit K stride).
-  unsigned kTile = instrShape.size() > static_cast<size_t>(rank)
-                       ? instrShape.back()
-                       : kWidth * 8;
+  // K-tile selection:
+  //   - new FP64 path stores K explicitly in instrShape (size > rank).
+  //   - legacy FP64 m8n8k4 path has instrShape=[8, 8] with K=4 implicit.
+  //   - everything else uses the standard sm_80 256-bit K stride (kWidth*8).
+  unsigned kTile;
+  if (instrShape.size() > static_cast<size_t>(rank))
+    kTile = instrShape.back();
+  else if (instrM == 8)
+    kTile = 4;
+  else
+    kTile = kWidth * 8;
   if (isA) {
     tileShape[rank - 2] = instrM;
     tileShape[rank - 1] = kTile;
