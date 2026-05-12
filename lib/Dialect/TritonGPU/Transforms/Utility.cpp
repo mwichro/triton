@@ -30,20 +30,21 @@ using namespace triton;
 
 SmallVector<unsigned, 3> mmaVersionToInstrShape(int version,
                                                 const ArrayRef<int64_t> &shape,
-                                                Type eltType, int numWarps) {
+                                                Type eltType, int numWarps,
+                                                int computeCapability) {
   if (version == 1)
     return {16, 16};
   else if (version == 2) {
     auto rank = shape.size();
-    // For FP64 we append the native K-dim (4 today; Phase 2/3 will pick 8/16)
-    // so layout and emit code can derive K without an out-of-band channel.
-    // Non-f64 dtypes keep the legacy 2-elt [M, N] shape; their K-tile is
-    // implicit (= kWidth * 8).
+    // m16n8k4.f64 requires sm_90+. On sm_80 we fall back to the legacy
+    // m8n8k4.f64 shape (encoded as 2-elt instrShape; K=4 is implicit and
+    // recovered downstream via the `instrM == 8` legacy branch).
     bool isF64 = eltType.isF64();
-    SmallVector<unsigned, 3> ret(rank + (isF64 ? 1u : 0u), 1);
+    bool isF64M16 = isF64 && computeCapability >= 90;
+    SmallVector<unsigned, 3> ret(rank + (isF64M16 ? 1u : 0u), 1);
     ret[rank - 1] = 8;
-    ret[rank - 2] = 16;
-    if (isF64)
+    ret[rank - 2] = isF64 && !isF64M16 ? 8 : 16;
+    if (isF64M16)
       ret[rank] = 4;
     return ret;
   } else if (version == 3) {

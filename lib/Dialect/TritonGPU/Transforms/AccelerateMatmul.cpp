@@ -338,8 +338,10 @@ static MMAEncodingResult createMMAEncodingForDot(DotOpInterface dotOp,
 
   auto CGALayout = getCGALayout(oldRetType.getEncoding());
   auto retShapePerCTA = getShapePerCTA(oldRetType);
-  auto instrShape = mmaVersionToInstrShape(versionMajor, retShapePerCTA,
-                                           oldAType.getElementType(), numWarps);
+  auto instrShape =
+      mmaVersionToInstrShape(versionMajor, retShapePerCTA,
+                             oldAType.getElementType(), numWarps,
+                             computeCapability);
   auto warpsPerTile = getWarpsPerTile(dotOp, retShapePerCTA, versionMajor,
                                       numWarps, instrShape);
 
