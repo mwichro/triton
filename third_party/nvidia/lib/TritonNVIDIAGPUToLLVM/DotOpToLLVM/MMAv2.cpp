@@ -6,6 +6,9 @@
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
 #include "llvm/ADT/SmallVector.h"
 
+#include <cstdlib>
+#include <optional>
+
 using namespace mlir;
 using namespace mlir::triton;
 
@@ -309,6 +312,8 @@ static Type getMmaRetType(TensorCoreType mmaType, MLIRContext *ctx) {
   Type i32Ty = type::i32Ty(ctx);
   Type fp64x2Ty =
       LLVM::LLVMStructType::getLiteral(ctx, SmallVector<Type>(2, fp64Ty));
+  Type fp64x4Ty =
+      LLVM::LLVMStructType::getLiteral(ctx, SmallVector<Type>(4, fp64Ty));
   Type fp32x4Ty =
       LLVM::LLVMStructType::getLiteral(ctx, SmallVector<Type>(4, fp32Ty));
   Type i32x4Ty =
@@ -337,7 +342,7 @@ static Type getMmaRetType(TensorCoreType mmaType, MLIRContext *ctx) {
   case TensorCoreType::INT32_INT8_INT8_INT32:
     return i32x4Ty;
   case TensorCoreType::FP64_FP64_FP64_FP64:
-    return fp64x2Ty;
+    return fp64x4Ty;
   case TensorCoreType::FP32_FP8E5M2_FP8E5M2_FP32_SCALE_VEC_1X:
   case TensorCoreType::FP32_FP8E5M2_FP8E4M3FN_FP32_SCALE_VEC_1X:
   case TensorCoreType::FP32_FP8E4M3FN_FP8E5M2_FP32_SCALE_VEC_1X:
@@ -482,8 +487,54 @@ inline static const std::map<TensorCoreType, std::string> mmaInstrPtxAmpere = {
      "mma.sync.aligned.m16n8k32.row.col.f16.e4m3.e4m3.f16"},
 
     {TensorCoreType::FP64_FP64_FP64_FP64,
-     "mma.sync.aligned.m8n8k4.row.col.f64.f64.f64.f64"},
+     "mma.sync.aligned.m16n8k4.row.col.f64.f64.f64.f64"},
 };
+
+// FP64 native MMA shape registry. Phase 1 ships m16n8k4 only; Phase 2/3 add
+// k8/k16 entries here without touching the emit loop. The selector picks one
+// entry per dot op; a `TRITON_FP64_MMA_K` env var overrides the default.
+struct Fp64MmaShape {
+  unsigned m, n, k;
+  // Number of native instructions stacked along the warp's M-tile per emit.
+  // For m16n8k4 the dot-operand layout already exposes 2 within-tile M regs,
+  // so a single PTX instruction covers a 16-row M-tile (mTilesPerInstr=1).
+  unsigned mTilesPerInstr;
+  // Per-thread register counts for A, B, C/D.
+  unsigned aRegs, bRegs, cRegs;
+  unsigned smMin; // Minimum compute capability (×10).
+  const char *ptxString;
+};
+
+inline static constexpr Fp64MmaShape kFp64Shapes[] = {
+    {16, 8, 4, 1, 2, 1, 4, 80,
+     "mma.sync.aligned.m16n8k4.row.col.f64.f64.f64.f64"},
+};
+
+static std::optional<unsigned> getFp64MmaKOverride() {
+  const char *env = std::getenv("TRITON_FP64_MMA_K");
+  if (!env || !*env)
+    return std::nullopt;
+  unsigned v = 0;
+  for (const char *p = env; *p; ++p) {
+    if (*p < '0' || *p > '9')
+      return std::nullopt;
+    v = v * 10 + (*p - '0');
+  }
+  return v;
+}
+
+// Phase 1: only one entry is registered, so the selector returns it. The API
+// is the one Phase 2/3/4 will continue to use — they add entries and refine
+// the default policy without touching callers.
+static const Fp64MmaShape &selectFp64Shape() {
+  if (auto overrideK = getFp64MmaKOverride()) {
+    for (const auto &s : kFp64Shapes)
+      if (s.k == *overrideK)
+        return s;
+    // Fall through if override doesn't match a registered shape.
+  }
+  return kFp64Shapes[0];
+}
 
 inline static const std::map<TensorCoreType, std::string> mmaInstrPtxScaled = {
     {TensorCoreType::FP32_FP8E5M2_FP8E5M2_FP32_SCALE_VEC_1X,
@@ -588,45 +639,44 @@ static void callMmaTuringFp16(PTXBuilder &builder, int b,
   mma(retArgs, aArgs2, bArgs2, cArgs);
 }
 
-// Emit m8n8k4 fp64 MMA instructions.
-// With numRegisters.m=1, numRegisters.k=1: emits a single m8n8k4.
-// With numRegisters.m=2, numRegisters.k=2: emits 2*2=4 m8n8k4 grouped as
-// m16n8k8
-static void callMmaAmpereFp64(PTXBuilder &builder, int b,
-                              const BaseOffset &base,
-                              mlir::triton::PTXInstr &mma, unsigned numMmaRets,
-                              unsigned colsPerThread, int numCPackedElem,
-                              unsigned batchOffset, ValueTableV2 &ha,
-                              ValueTableV2 &hb, const SmallVector<Value> &fc,
-                              int kRegs, int mRegs) {
-  // Each m sub-tile gets numMmaRets/mRegs results (2 f64 values per m8n8k4).
-  int retsPerM = numMmaRets / mRegs;
+// Emit a single fp64 m16n8k4 MMA instruction per call.
+//   A: 2 regs/thread at (gid, tid) and (gid+8, tid)
+//   B: 1 reg/thread at  (tid, gid)
+//   C: 4 regs/thread at (gid, 2*tid+{0,1}), (gid+8, 2*tid+{0,1})
+// The dot-operand layout already exposes the two within-tile A registers as
+// adjacent entries in ha (ha[{b, base.m, k}] and ha[{b, base.m+1, k}]), so a
+// single PTX instruction covers a full 16-row M-tile and a 4-col K-tile.
+//
+// Phase 2/3 will register additional Fp64MmaShape entries (k=8, k=16) and
+// extend the emit loop to consume more K registers per instruction.
+static void callMmaAmpereFp64M16K4(PTXBuilder &builder, int b,
+                                   const BaseOffset &base,
+                                   mlir::triton::PTXInstr &mma,
+                                   unsigned numMmaRets, unsigned colsPerThread,
+                                   int numCPackedElem, unsigned batchOffset,
+                                   ValueTableV2 &ha, ValueTableV2 &hb,
+                                   const SmallVector<Value> &fc) {
+  assert(numMmaRets == 4 && "m16n8k4.f64 produces 4 f64 outputs/thread");
 
-  // Build ret/c operand lists for each m sub-tile.
-  SmallVector<PTXBuilder::Operand *> retArgsList, cArgsList;
-  for (int vm = 0; vm < mRegs; ++vm) {
-    auto *retArgs = builder.newListOperand(retsPerM, "=d");
-    auto *cArgs = builder.newListOperand();
-    for (int i = 0; i < retsPerM; ++i) {
-      cArgs->listAppend(
-          builder.newOperand(fc[((base.m + vm) * colsPerThread +
-                                 numMmaRets * numCPackedElem * base.n) /
-                                    numCPackedElem +
-                                i + batchOffset * b],
-                             std::to_string(i)));
-    }
-    retArgsList.push_back(retArgs);
-    cArgsList.push_back(cArgs);
+  auto *retArgs = builder.newListOperand(numMmaRets, "=d");
+  auto *cArgs = builder.newListOperand();
+  unsigned cBase =
+      (base.m * colsPerThread + numMmaRets * numCPackedElem * base.n) /
+          numCPackedElem +
+      batchOffset * b;
+  for (unsigned i = 0; i < numMmaRets; ++i) {
+    cArgs->listAppend(
+        builder.newOperand(fc[cBase + i], std::to_string(i)));
   }
 
-  for (int vk = 0; vk < kRegs; ++vk) {
-    auto bArgs = builder.newListOperand({{hb[{b, base.n, base.k + vk}], "d"}});
-    for (int vm = 0; vm < mRegs; ++vm) {
-      auto aArgs =
-          builder.newListOperand({{ha[{b, base.m + vm, base.k + vk}], "d"}});
-      mma(retArgsList[vm], aArgs, bArgs, cArgsList[vm]);
-    }
-  }
+  auto *aArgs = builder.newListOperand({
+      {ha[{b, base.m + 0, base.k}], "d"},
+      {ha[{b, base.m + 1, base.k}], "d"},
+  });
+  auto *bArgs =
+      builder.newListOperand({{hb[{b, base.n, base.k}], "d"}});
+
+  mma(retArgs, aArgs, bArgs, cArgs);
 }
 
 // Unified MMAV2 function for Ampere and HopperF64 architectures
@@ -778,7 +828,8 @@ convertMMAImpl(DotOpInterface op, Value llvmA, Value llvmB, Value llvmC,
   auto fc = unpackLLElements(loc, loadedC, rewriter);
 
   int bitwidthRet = dTensorTy.getElementType().getIntOrFloatBitWidth();
-  auto numMmaRets = bitwidthRet == 64 ? 2 : bitwidthRet / 8;
+  // f64: m16n8k4 returns 4 f64 outputs per thread (was 2 for m8n8k4).
+  auto numMmaRets = bitwidthRet == 64 ? 4 : bitwidthRet / 8;
   int numCPackedElem = bitwidthRet == 64 ? 1 : 4 / numMmaRets;
 
   auto rank = dTensorTy.getRank();
@@ -849,8 +900,11 @@ LogicalResult convertMMA(triton::DotOp op, triton::DotOp::Adaptor adaptor,
     return op.emitError(
         "unsupported MMA instruction for the given operand/result types");
 
+  // For f64 m16n8k4 the warp tile is M=16, N=8, K=4. A is laid out with two
+  // registers per thread along M (gid, gid+8), so we consume two adjacent
+  // entries in the A value table per instruction.
   NumRegisters numRegisters = (mmaType == TensorCoreType::FP64_FP64_FP64_FP64)
-                                  ? NumRegisters{1, 1, 1}
+                                  ? NumRegisters{2, 1, 1}
                                   : NumRegisters{2, 1, 2};
 
   EmitMmaCallback emit = [&](PTXBuilder &builder, int b, int m, int n, int k,
@@ -874,9 +928,8 @@ LogicalResult convertMMA(triton::DotOp op, triton::DotOp::Adaptor adaptor,
                           numCPackedElem, ha, hb, fc, isAccF16);
     } else {
       if (isFp64MMA) {
-        callMmaAmpereFp64(builder, b, base, mma, numMmaRets, colsPerThread,
-                          numCPackedElem, batchOffset, ha, hb, fc,
-                          numRegisters.k, numRegisters.m);
+        callMmaAmpereFp64M16K4(builder, b, base, mma, numMmaRets, colsPerThread,
+                               numCPackedElem, batchOffset, ha, hb, fc);
       } else {
         callMmaV2(builder, b, base, mma, numMmaRets, colsPerThread,
                   numCPackedElem, batchOffset, ha, hb, fc,

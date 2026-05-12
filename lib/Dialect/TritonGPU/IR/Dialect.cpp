@@ -2785,7 +2785,7 @@ NvidiaMmaEncodingAttr::getRepForOperand(ArrayRef<int64_t> shape, int bitwidth,
   auto tileBitWidthK = bitwidth == 64 ? (1 * 256) : (4 * 64);
   if (opIdx == 0) {
     // m x k
-    tileSize.push_back(bitwidth == 64 ? 8 : 16);
+    tileSize.push_back(16);
     tileSize.push_back(tileBitWidthK / bitwidth);
   } else {
     // k x n

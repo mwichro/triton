@@ -986,8 +986,11 @@ NvidiaMmaEncodingAttr::toLinearLayout(ArrayRef<int64_t> shape) const {
 
   SmallVector<unsigned> tileShape;
   if (isAmpere()) {
-    // Ampere.getInstrShape() returns the tile shape
-    tileShape = SmallVector<unsigned>(getInstrShape());
+    // Ampere.getInstrShape() returns the tile shape. For FP64 it may carry a
+    // trailing K-dim (see mmaVersionToInstrShape); drop it here — the
+    // accumulator tile is M×N only.
+    auto instr = getInstrShape();
+    tileShape = SmallVector<unsigned>(instr.take_front(rank));
   } else {
     assert(isHopper());
     auto instrShapeMNK = getInstrShape();
@@ -1014,16 +1017,20 @@ LinearLayout nvidiaDotToLinearLayout(ArrayRef<int64_t> shape,
   MLIRContext *ctx = mma.getContext();
 
   SmallVector<unsigned> tileShape(rank, 1);
-  unsigned instrM = mma.getInstrShape()[rank - 2];
-  // For fp64 (instrM == 8), the native m8n8k4 instruction uses a smaller tile.
-  unsigned kTileMultiplier = instrM == 8 ? 4 : 8;
+  auto instrShape = mma.getInstrShape();
+  unsigned instrM = instrShape[rank - 2];
+  // FP64 stores its native K in instrShape (size > rank). Other dtypes leave
+  // K implicit at `kWidth * 8` (the standard sm_80 256-bit K stride).
+  unsigned kTile = instrShape.size() > static_cast<size_t>(rank)
+                       ? instrShape.back()
+                       : kWidth * 8;
   if (isA) {
     tileShape[rank - 2] = instrM;
-    tileShape[rank - 1] = kWidth * kTileMultiplier;
+    tileShape[rank - 1] = kTile;
   } else {
     // Hopper takes the rhs via shared memory
     assert(mma.isAmpere());
-    tileShape[rank - 2] = kWidth * kTileMultiplier;
+    tileShape[rank - 2] = kTile;
     tileShape[rank - 1] = 8;
   }
   auto order = getOrderForDotOperand(dot.getOpIdx(), rank, /*kContig*/ true);

@@ -35,9 +35,16 @@ SmallVector<unsigned, 3> mmaVersionToInstrShape(int version,
     return {16, 16};
   else if (version == 2) {
     auto rank = shape.size();
-    SmallVector<unsigned, 3> ret(rank, 1);
+    // For FP64 we append the native K-dim (4 today; Phase 2/3 will pick 8/16)
+    // so layout and emit code can derive K without an out-of-band channel.
+    // Non-f64 dtypes keep the legacy 2-elt [M, N] shape; their K-tile is
+    // implicit (= kWidth * 8).
+    bool isF64 = eltType.isF64();
+    SmallVector<unsigned, 3> ret(rank + (isF64 ? 1u : 0u), 1);
     ret[rank - 1] = 8;
-    ret[rank - 2] = eltType.isF64() ? 8 : 16;
+    ret[rank - 2] = 16;
+    if (isF64)
+      ret[rank] = 4;
     return ret;
   } else if (version == 3) {
     unsigned k = 256 / eltType.getIntOrFloatBitWidth();
