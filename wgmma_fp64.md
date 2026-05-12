@@ -151,3 +151,30 @@ This matches the `accSize` logic if audited carefully for 64-bit element sizes.
 
 
 ## Progress 
+
+
+
+Critical finding: the roadmap in wgmma_fp64.md is based on a false premise. The PTX instruction wgmma.mma_async.sync.aligned.m64nNk{4,16}.f64.f64.f64 does not exist. wgmma.mma_async is not defined for .f64 element types in PTX ISA.
+
+What I verified
+I implemented the roadmap end‑to‑end (all 7 touchpoints) and got compilation as far as PTX emission. The Triton-emitted PTX is structurally what the doc described:
+
+wgmma.mma_async.sync.aligned.m64n64k4.f64.f64.f64 {%rd...32...}, %rd60, %rd61, %p8;
+ptxas 12.9 rejects it: Unknown modifier '.m64n64k4' and Unexpected instruction types specified for 'wgmma.mma_async'.
+I tried hand-written PTX with .f64 registers (%fd) and tried k=4, k=8, k=16, with/without imm-scale-a,b and trans args, with N=8 and N=64. Every variant fails with Unexpected instruction types. Only k=16 gets past the modifier parse — meaning mNk16 is the only recognized shape — but the .f64 dtype combo is still rejected.
+CUTLASS's mma_sm90_gmma.hpp contains 646 wgmma instances; none reference f64.
+NVIDIA's PTX ISA docs do not list .f64 among wgmma.mma_async supported dtypes (they list f16/bf16/tf32/fp8/int8).
+Conclusion
+FP64 matmul on H100 uses the legacy synchronous mma.sync (MMA v2) instruction — which the codebase already supports and the benchmark already exercises (the ~31 TFLOPS in fp64_H100.txt is the v2 path running on SM90). There is no v3/async FP64 path on Hopper to enable.
+
+State of the working tree
+The implementation changes are still in place on wgmma_fp64 branch:
+
+NVGPUOps.td — added f64 enum case
+NVGPUToLLVMPass.cpp — =d constraint and f64 support gate
+WGMMA.cpp — f64 in getMmaRetType/getMmaOperandType, smem-A guard
+Utility.cpp (Analysis) — supportMMA v3 gate relaxed for f64 (% 8 on N)
+Utility.cpp (Transforms) — validN for f64
+AccelerateMatmul.cpp — f64 forced to smem-A path
+compiler.py — already (1,1,4) for 64‑bit
+These changes are dead code given the hardware reality. Recommend: revert these changes. Want me to revert? If improving FP64 throughput on H100 is the actual goal, the lever would be optimizing the existing MMAv2 path (better software pipelining / smem layouts) rather than enabling a v3 instruction that doesn't exist
