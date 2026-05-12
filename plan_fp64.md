@@ -42,10 +42,10 @@ For Phase 2/3:
 
 ## Phasing
 
-- **Phase 1 — m16n8k4.f64.** Critical path. Biggest layout change, smallest emit change. Checkpoint here.
-- **Phase 2 — m16n8k8.f64.** K-extension on top of Phase 1.
-- **Phase 3 — m16n8k16.f64.** Closes the cuBLAS gap. sm_90-gated.
-- **Phase 4 — Shape-selection heuristic.** Pick the right native shape per problem.
+- **Phase 1 — m16n8k4.f64 + selection mechanism.** Critical path. Introduces the shape-selection plumbing (table + override) even though only k4 is registered, so Phase 2/3 are pure additions.
+- **Phase 2 — m16n8k8.f64.** Register a second shape entry. `mXn8k4` remains selectable via the Phase 1 override.
+- **Phase 3 — m16n8k16.f64.** Third shape entry. sm_90-gated. Closes the cuBLAS gap.
+- **Phase 4 — Auto-selection heuristic.** Default policy that picks the largest K that fits, layered on top of the Phase 1 override (override always wins).
 
 Each phase is independently shippable.
 
@@ -90,29 +90,53 @@ Replace:
 ```
 with `m16n8k4`. Keep the `TensorCoreType` enum value; switching the PTX string follows from the new instr shape.
 
-### 1.6 Replace `callMmaAmpereFp64`
-[third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM/MMAv2.cpp:595](third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM/MMAv2.cpp#L595)
+### 1.6 Shape table + selection mechanism (new — load-bearing for Phase 2/3)
 
-Current code synthesizes `m16n8k8` from 4× `m8n8k4`. Rewrite to emit one real `m16n8k4` per (warp-M-tile, K-step):
-- 2 A regs, 1 B reg, 4 C regs per instruction (`=d` constraint).
-- Outer loop over `repM = warpTileM / 16` — one instruction per repeat, advancing A base by 16 rows. **This is the `mXn8k4` repetition path.**
-- Outer loop over `repK = BLOCK_K / 4` — advance A and B by 4 columns/rows.
+Introduce a registry of FP64 native shapes and a selector. Phase 1 registers a single entry; Phase 2/3 are pure table additions.
 
-**Extensibility hook:** structure the helper around a small struct describing the native shape:
 ```cpp
 struct Fp64MmaShape {
   unsigned m, n, k;          // 16, 8, {4|8|16}
   unsigned aRegs, bRegs, cRegs;
+  unsigned smMin;            // 80 or 90
   const char *ptxString;
 };
-```
-Phase 2/3 plug in new entries; the emit loop is shape-agnostic.
 
-### 1.7 Tests
+// Phase 1 registers only k4. Phase 2 adds k8. Phase 3 adds k16.
+static const Fp64MmaShape kFp64Shapes[] = {
+  {16, 8, 4, 2, 1, 4, 80, "mma.sync.aligned.m16n8k4.row.col.f64.f64.f64.f64"},
+};
+
+// Selector: explicit override beats heuristic. Phase 1 only has one shape
+// to return, but the API is the one Phase 2/3/4 will keep using.
+const Fp64MmaShape &selectFp64Shape(unsigned smArch, unsigned blockK,
+                                    std::optional<unsigned> overrideK);
+```
+
+**Override surface in Phase 1** (pick one — needs decision):
+- `tl.dot(..., fp64_mma_k=4)` Python kwarg threaded through `tt.dot` attr, OR
+- environment variable `TRITON_FP64_MMA_K` for global override, OR
+- an attribute on `NvidiaMmaEncodingAttr` storing the chosen K.
+
+Recommendation: store on `NvidiaMmaEncodingAttr` (so it survives IR roundtrips and pipeline transforms), plumb the env var through `mmaVersionToInstrShape` as the producer. The Python kwarg can be added later without breaking the IR contract.
+
+In Phase 1 the selector returns the k4 entry unconditionally — the override exists but has only one valid value. Adding shapes in Phase 2/3 makes the override meaningful without API changes.
+
+### 1.7 Replace `callMmaAmpereFp64`
+[third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM/MMAv2.cpp:595](third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM/MMAv2.cpp#L595)
+
+Current code synthesizes `m16n8k8` from 4× `m8n8k4`. Rewrite to be shape-table-driven: take an `Fp64MmaShape` and emit one real instruction per (warp-M-tile, K-step):
+- `shape.aRegs` A regs, `shape.bRegs` B regs, `shape.cRegs` C regs (`=d` constraint).
+- Outer loop over `repM = warpTileM / 16` — one instruction per repeat, advancing A base by 16 rows. **This is the `mXn8k4` repetition path.**
+- Outer loop over `repK = BLOCK_K / shape.k` — advance A and B by `shape.k` columns/rows.
+
+Phase 1 only exercises the k=4 path; the loop is shape-agnostic so Phase 2/3 reuse it.
+
+### 1.8 Tests
 - [python/test/unit/language/test_core.py](python/test/unit/language/test_core.py) — extend FP64 dot tests across M ∈ {16, 32, 64, 128} × N ∈ {8, 16, 32} × K ∈ {4, 8, 16, 32, 64}.
 - Lit test in [test/Conversion/](test/Conversion/) — assert f64 dots lower to `m16n8k4.row.col.f64`, not `m8n8k4`.
 
-### 1.8 Benchmark
+### 1.9 Benchmark
 Rerun [python/tutorials/03-matrix-multiplication.py](python/tutorials/03-matrix-multiplication.py) FP64 mode against [fp64_H100.txt](fp64_H100.txt) baseline. **Expected: ~40 TFLOPS** at large M=N=K (from 31). Phase 1 alone won't reach cuBLAS — that's Phase 3.
 
 ---
@@ -123,10 +147,9 @@ Layout work mostly inherited from Phase 1 (accumulator unchanged).
 
 - A: 4 elts/thread. `a[0,1] = (gid, 2*tid+{0,1})`, `a[2,3] = (gid+8, 2*tid+{0,1})`.
 - B: 2 elts/thread. `b[0,1] = (2*tid+{0,1}, gid)`.
-- New PTX string `mma.sync.aligned.m16n8k8.row.col.f64.f64.f64.f64`.
-- `mmaVersionToInstrShape` needs to carry a K value for f64 — currently the v2 path returns 2D. Either add a K dim or thread the chosen K through the lowering separately.
-
-If the Phase 1 `Fp64MmaShape` table is in place, the emit side is a one-line addition.
+- New entry in `kFp64Shapes` table (one line; emit side is shape-agnostic).
+- A/B operand `DotOperandEncoding` need K-aware layouts — the K=4 path stays untouched.
+- The selector now has a real choice; Phase 1 override (`overrideK=4`) keeps `mXn8k4` reachable.
 
 ## Phase 3 — m16n8k16.f64
 
@@ -134,14 +157,14 @@ Same layout pattern, doubled K. **Gate on sm_90+** (current target). Accumulator
 
 Expected: ~55 TFLOPS — cuBLAS parity.
 
-## Phase 4 — Shape selection
+## Phase 4 — Auto-selection heuristic
 
-Pick the largest native K that divides `BLOCK_K`, subject to register budget:
+Default policy layered on top of the Phase 1 override (override always wins):
 - sm_90 and `BLOCK_K % 16 == 0` → m16n8k16
 - `BLOCK_K % 8 == 0` → m16n8k8
 - else → m16n8k4
 
-`mXn8k4` stays selectable via an option / builtin override for the user's critical path.
+`mXn8k4` stays selectable via the Phase 1 override — no API change here, just a smarter default when no override is set.
 
 ---
 
@@ -158,7 +181,7 @@ Pick the largest native K that divides `BLOCK_K`, subject to register budget:
 
 ## Checkpoints
 
-- **Phase 1 done** when: m16n8k4 emits, all FP64 unit tests pass, M ∈ {16, 32, 64, ...} all produce numerically correct output, FP64 benchmark shows ≥35 TFLOPS at M=N=K=4096.
+- **Phase 1 done** when: m16n8k4 emits, shape-selection mechanism (table + override surface) is in place with k4 registered, all FP64 unit tests pass, M ∈ {16, 32, 64, ...} all produce numerically correct output, FP64 benchmark shows ≥35 TFLOPS at M=N=K=4096.
 - **Phase 2 done** when: m16n8k8 selectable via shape table, benchmark ≥45 TFLOPS.
 - **Phase 3 done** when: m16n8k16 selectable on sm_90, benchmark approaches cuBLAS (≥50 TFLOPS).
 - **Phase 4 done** when: heuristic auto-selects per problem; `mXn8k4` override still honored.
