@@ -39,7 +39,9 @@ namespace {
 
 triton::nvgpu::WGMMAEltType getMmaRetType(Value d) {
   auto dTy = cast<RankedTensorType>(d.getType()).getElementType();
-  if (dTy.isF32()) {
+  if (dTy.isF64()) {
+    return triton::nvgpu::WGMMAEltType::f64;
+  } else if (dTy.isF32()) {
     return triton::nvgpu::WGMMAEltType::f32;
   } else if (dTy.isF16()) {
     return triton::nvgpu::WGMMAEltType::f16;
@@ -52,7 +54,9 @@ triton::nvgpu::WGMMAEltType getMmaRetType(Value d) {
 
 triton::nvgpu::WGMMAEltType getMmaOperandType(Value a, bool allowTF32) {
   auto aTy = cast<triton::gpu::TensorOrMemDesc>(a.getType()).getElementType();
-  if (aTy.isF16()) {
+  if (aTy.isF64()) {
+    return triton::nvgpu::WGMMAEltType::f64;
+  } else if (aTy.isF16()) {
     return triton::nvgpu::WGMMAEltType::f16;
   } else if (aTy.isBF16()) {
     return triton::nvgpu::WGMMAEltType::bf16;
@@ -194,6 +198,10 @@ LogicalResult convertDot(const LLVMTypeConverter *typeConverter,
   auto bTensorTy = cast<triton::gpu::MemDescType>(b.getType());
   auto dTensorTy = cast<RankedTensorType>(d.getType());
   bool aInShared = isa<SharedEncodingTrait>(aTensorTy.getEncoding());
+  if (!aInShared && aTensorTy.getElementType().isF64()) {
+    return mlir::emitError(
+        loc, "WGMMA FP64 requires operand A to be in shared memory");
+  }
   auto mmaEncoding = cast<NvidiaMmaEncodingAttr>(dTensorTy.getEncoding());
   std::optional<SharedMemoryObject> smemObjA;
   Value baseA;

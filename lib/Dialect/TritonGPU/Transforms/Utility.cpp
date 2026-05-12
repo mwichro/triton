@@ -61,6 +61,13 @@ SmallVector<unsigned, 3> mmaVersionToInstrShape(int version,
                      24, 16, 8});
     }
 
+    if (eltType.isF64()) {
+      // FP64 WGMMA: N multiples of 8 up to 256.
+      validN.assign({256, 248, 240, 232, 224, 216, 208, 200, 192, 184, 176,
+                     168, 160, 152, 144, 136, 128, 120, 112, 104, 96,  88,
+                     80,  72,  64,  56,  48,  40,  32,  24,  16,  8});
+    }
+
     unsigned m = 16;
     unsigned mWarps = std::max<unsigned>(shape[0] / m, 1);
     unsigned nWarps = std::max<unsigned>(numWarps / mWarps, 1);

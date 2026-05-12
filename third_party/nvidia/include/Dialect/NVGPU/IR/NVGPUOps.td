@@ -80,7 +80,7 @@ def WGMMA_LayoutAttr : I32EnumAttr<"WGMMALayout",
 }
 
 def WGMMA_EltTypeAttr : I32EnumAttr<"WGMMAEltType",
-    "wgmma operand type, either 's8', 's32', 'e4m3', 'e5m2', 'f16', 'bf16', 'tf32', or 'f32'",
+    "wgmma operand type, either 's8', 's32', 'e4m3', 'e5m2', 'f16', 'bf16', 'tf32', 'f32', or 'f64'",
     [
       I32EnumAttrCase<"s8", 0>,
       I32EnumAttrCase<"s32", 1>,
@@ -89,7 +89,8 @@ def WGMMA_EltTypeAttr : I32EnumAttr<"WGMMAEltType",
       I32EnumAttrCase<"f16", 4>,
       I32EnumAttrCase<"bf16", 5>,
       I32EnumAttrCase<"tf32", 6>,
-      I32EnumAttrCase<"f32", 7>
+      I32EnumAttrCase<"f32", 7>,
+      I32EnumAttrCase<"f64", 8>
     ]>{
   let cppNamespace = "::mlir::triton::nvgpu";
 }

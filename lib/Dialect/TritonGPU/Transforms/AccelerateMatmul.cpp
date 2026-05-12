@@ -422,10 +422,16 @@ public:
     if (mmaResult.versionMajor == 3) {
       auto eltType = cast<RankedTensorType>(a.getType()).getElementType();
       bool allowTranspose = eltType.isF16() || eltType.isBF16();
-      if (!aFromLoad) {
+      if (!aFromLoad && !eltType.isF64()) {
         int bitwidth = getElementTypeOrSelf(a).getIntOrFloatBitWidth();
         a = convertDotOperandForMMA(a, 0, bitwidth, mmaResult.newRetType,
                                     rewriter);
+      } else if (eltType.isF64()) {
+        // FP64 WGMMA requires operand A in shared memory; transposes are not
+        // supported by the FP64 wgmma instruction.
+        a = getSharedMemoryMMAOperand(a, rewriter, 0, /*allowTranspose=*/false,
+                                      /*isMMAv5Fp4Padded=*/false,
+                                      /*forceTranspose=*/false, dotOp);
       } else {
         a = getSharedMemoryMMAOperand(a, rewriter, 0, allowTranspose,
                                       /*isMMAv5Fp4Padded=*/false,

@@ -361,8 +361,14 @@ public:
 
     auto outputStructType = dyn_cast<LLVM::LLVMStructType>(resultType);
     uint32_t numOutputRegs = outputStructType.getBody().size();
-    std::string output =
-        outputStructType.getBody().front().isF32() ? "=f" : "=r";
+    Type frontTy = outputStructType.getBody().front();
+    std::string output;
+    if (frontTy.isF64())
+      output = "=d";
+    else if (frontTy.isF32())
+      output = "=f";
+    else
+      output = "=r";
     return std::vector<std::string>(numOutputRegs, output);
   }
 
@@ -454,6 +460,14 @@ public:
                    (eltTypeB == WGMMAEltType::s8) &&
                    (eltTypeC == WGMMAEltType::s32) &&
                    (m == 64 && 8 <= n && n <= 224 && k == 32);
+      // FP64 WGMMA: A and B must both be from shared memory (no transpose
+      // modifiers, no imm-scale modifiers). M=64, N multiple of 8 up to 256,
+      // K=16.
+      bool f64Case = (eltTypeA == WGMMAEltType::f64) &&
+                     (eltTypeB == WGMMAEltType::f64) &&
+                     (eltTypeC == WGMMAEltType::f64) &&
+                     (m == 64 && 8 <= n && n <= 256 && k == 16);
+      supported |= f64Case;
     }
     assert(supported && "WGMMA type or shape is not supported");
 

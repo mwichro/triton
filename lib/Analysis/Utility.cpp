@@ -1221,11 +1221,12 @@ bool supportMMA(triton::DotOp op, int version) {
     // TODO(Keren): for now, fallback to MMAv2 if handling batch matmul.
     if (rank == 3)
       return false;
-    if (!(numWarps % 4 == 0 && retShapePerCTA[rank - 2] % 64 == 0 &&
-          retShapePerCTA[rank - 1] % 16 == 0 &&
+    bool nOk = aElemTy.isF64() ? (retShapePerCTA[rank - 1] % 8 == 0)
+                               : (retShapePerCTA[rank - 1] % 16 == 0);
+    if (!(numWarps % 4 == 0 && retShapePerCTA[rank - 2] % 64 == 0 && nOk &&
           (llvm::isa<Float8E5M2Type, Float8E4M3FNType>(aElemTy) ||
            aElemTy.isInteger(8) || aElemTy.isF16() || aElemTy.isBF16() ||
-           aElemTy.isF32()))) {
+           aElemTy.isF32() || aElemTy.isF64()))) {
       return false;
     }
     // We cannot use MMA_V3 if we need to accumulate in F32 within the MMA op.
