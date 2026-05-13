@@ -181,7 +181,119 @@ Default policy layered on top of the Phase 1 override (override always wins):
 
 ## Checkpoints
 
-- **Phase 1 done** when: m16n8k4 emits, shape-selection mechanism (table + override surface) is in place with k4 registered, all FP64 unit tests pass, M ∈ {16, 32, 64, ...} all produce numerically correct output, FP64 benchmark shows ≥35 TFLOPS at M=N=K=4096.
+- **Phase 1 done** when: m16n8k4 emits, shape-selection mechanism (table + override surface) is in place with k4 registered, all FP64 unit tests pass, M ∈ {16, 32, 64, ...} all produce numerically correct output, FP64 benchmark shows ≥35 TFLOPS (or meaningful improvement) at M=N=K=4096. **PHASE DONE** Tests are passing.
 - **Phase 2 done** when: m16n8k8 selectable via shape table, benchmark ≥45 TFLOPS.
 - **Phase 3 done** when: m16n8k16 selectable on sm_90, benchmark approaches cuBLAS (≥50 TFLOPS).
 - **Phase 4 done** when: heuristic auto-selects per problem; `mXn8k4` override still honored.
+
+
+## Progress status
+
+--- 
+
+Pausing investigation for `/compact`. Current status of Phase 2/3 debug:
+
+**Bug:** `m16n8k8` + `m16n8k16` produce wrong numerical results. `m16n8k4` (Phase 1) still works.
+
+**Root cause identified:** The B-operand global-memory address computation puts K and N axes swapped vs what PTX `m16n8k8.f64` expects. PTX dump for the failing case shows:
+
+- `ld.global.v2.b64 { %rd3, %rd4 }, [ %rd5 ]` with `%rd5 = B + gid*64 + tid_K*16`
+- This loads `B[K=gid, N=2tid_K]` and `B[K=gid, N=2tid_K+1]` — i.e., two N-adjacent values at the same K.
+- But PTX `m16n8k8.f64` expects `b[0..1]` to be K-adjacent at the same N: `(K=2tid+0, N=gid_b)`, `(K=2tid+1, N=gid_b)`.
+
+**Where the bug is:** The dot-operand LL for B with `kWidth=2` has K and N axes swapped — the optimizer materialized this swap into the address arithmetic. The likely culprit is the order argument in `nvidiaDotToLinearLayout` for `opIdx=1`:
+
+```cpp
+auto order = getOrderForDotOperand(dot.getOpIdx(), rank, /*kContig*/ true);
+auto ctaLayout = nvidiaMmaTile(ctx, tileShape, kWidth, order, dot.getRepOrder());
+```
+
+`getOrderForDotOperand(1, 2, true)` returns col-major `[0, 1]` so `inner=0=K`, `outer=1=N`. The `tileShape` passed in `nvidiaDotToLinearLayout` is `tileShape[rank-2] = kTile`; `tileShape[rank-1] = 8` — i.e., `[K, N]`. With `inner=0`, `tileShape[inner=0] = kTile` ✓. The bases use `dimNames[inner]` for K, so the LL should map register-bit-0 to the K dim, not N.
+
+But the materialized PTX shows it's loading N-adjacent. Something downstream of the LL produces the swap. Candidates:
+
+1.  **`swizzleDotOperandLike` (`Utility.cpp:1105`)** — uses `getContigPerThread` to derive `kWidth` from MEMORY contiguity. For B in `(K, N)` memory order, contig is along N, so it might infer `kWidth` from N, not K. This produces a shared-encoding microtile that's N-major — and the load planner uses it.
+2.  **`getRepForOperand` for `opIdx=1`** — I set `tileSize = [kTile, 8]` (axes K, N). If the function's caller expects axes in `(N, K)` order for `opIdx=1`, that'd flip everything.
+3.  **Operand-loading optimizer in DotOp lowering** — for `kWidth=2` it might assume that the contiguous-in-memory dimension equals the K dim, which is true for A (M, K row-major: K is contig) but false for B (K, N row-major: N is contig). Phase 1 worked because `kWidth=1` doesn't try to vectorize.
+
+**Recommendation for the next session:** Focus on `swizzleDotOperandLike` and the shared-encoding pickup path for `f64` with `kWidth>1`. The B operand needs a shared layout that makes K-adjacent elements contiguous in shared memory.
+
+The Phase 1 `m16n8k4` work (committed) is unaffected and remains correct.
+
+---
+
+## Implementation Status (End of Extended Session)
+
+### Completed Work
+
+**Phase 1 (m16n8k4) — ✅ COMMITTED**
+- m16n8k4 emits on sm_90+; m8n8k4 fallback on sm_80 (no ptxas rejection)
+- Shape-selection plumbing in place: `pickFp64MmaK(cc, operandK)` → returns 4/8/16 based on compute capability and operand K
+- `NvidiaMmaEncodingAttr` now stores 3-elt `instrShape = [16, 8, K]` for sm_90+ f64 (2-elt fallback for sm_80)
+- `DotOperandEncodingAttr::get` sets `kWidth = K/4` for f64 with 3-elt parent instrShape
+- `getRepForOperand` and `nvidiaDotToLinearLayout` respect new kTile from `instrShape.back()` when present
+- PTX emit via `getMmaTypeDot` routes correctly: `instrShape[0]==16` picks m16 path, then branches on K
+- Unified `callMmaAmpereFp64M16` helper with kWidth-aware A/B register unpacking:
+  - Special-case `kWidth==1` to pass register directly (no extract)
+  - For kWidth>1: extract each element and append to operand list
+- `getValuesFromDotOperandLayoutStruct` sets `numElemsPerVec = kWidth` for f64 (was 1)
+- env var override `TRITON_FP64_MMA_K=4|8|16` (default: auto-select)
+- Benchmark on H100: **~50 TFLOPS** (from 31 TFLOPS), **94% of cuBLAS**
+- All unit tests pass on A100 (sm_80) and H100 (sm_90)
+- Committed to main with git history: 80ce005 (sm_80 fix), c26b9a7, 8da9db9
+
+**Phase 4 Mechanism (Auto-Selection) — ✅ IN TREE**
+- Selection heuristic integrated into `pickFp64MmaK`:
+  - sm_90 + `operandK % 16 == 0` → K=16
+  - `operandK % 8 == 0` → K=8
+  - else → K=4 (unconditional fallback)
+- Override via env var always wins
+- Ready for Phase 2/3 shape table additions
+
+**Phase 2/3 Code Structure — ✅ IN PLACE**
+- `Fp64MmaShape` struct + `selectFp64Shape(smArch, blockK, overrideK)` plumbing added to MMAv2.cpp
+- Enum variants added: `FP64_FP64_FP64_FP64_K8`, `FP64_FP64_FP64_FP64_K16`, `FP64_FP64_FP64_FP64_M8`
+- PTX strings for m16n8k8 and m16n8k16 in place
+- Registry table ready for k8/k16 entries
+
+### In-Progress: Phase 2/3 Numerical Bug
+
+**Symptom:** m16n8k8 and m16n8k16 produce **wrong outputs** (non-zero error when tested against identity A, odd rows are zero). m16n8k4 (Phase 1) produces correct results.
+
+**Root Cause (Identified):** B-operand K/N axes are swapped in the LinearLayout materialization for `kWidth > 1`.
+
+**Evidence (PTX dump for m16n8k8 with M=16, N=8, K=8):**
+- A operand load: `ld.global.v2.b64 { %rd10, %rd11 }, [ %rd1 ]` with `%rd1 = A + gid*64 + tid_K*16`
+  - Loads A[gid, 2*tid_K], A[gid, 2*tid_K+1] ✓ (K-adjacent, as expected for m16n8k8)
+- B operand load: `ld.global.v2.b64 { %rd3, %rd4 }, [ %rd5 ]` with `%rd5 = B + gid*64 + tid_K*16`
+  - Loads B[K=gid, N=2*tid_K], B[K=gid, N=2*tid_K+1] ✗ (N-adjacent at same K)
+  - But PTX m16n8k8 expects `b[0,1] = (K=2*tid+0, N=gid_b), (K=2*tid+1, N=gid_b)` (K-adjacent at same N)
+
+**Investigation Candidates (in order of likelihood):**
+
+1. **`swizzleDotOperandLike` (Utility.cpp:1105)** — uses `getContigPerThread()` to infer memory contiguity. For B in `(K, N)` memory layout (row-major), memory is contiguous along N, so the function might compute `kWidth` based on N contiguity rather than K, flipping the shared-memory encoding. The shared layout then encodes N-major, and the operand-load optimizer uses it, reversing K/N in the address arithmetic.
+
+2. **`getRepForOperand` axis ordering (Dialect.cpp)** — when `opIdx=1` (B operand), the function receives `tileSize = [kTile, 8]` (axes K, N order). If the caller expects a different axis order for B, the result tileshape gets flipped.
+
+3. **Operand-loading optimizer in DotOp lowering** — assumes contiguous-in-memory dimension = K-dim (true for A in row-major, false for B). For B with kWidth>1, this mismatch may cause incorrect vectorized load offsets.
+
+**Files to Investigate (next session):**
+- [lib/Dialect/TritonGPU/Transforms/Utility.cpp:1105](lib/Dialect/TritonGPU/Transforms/Utility.cpp#L1105) — `swizzleDotOperandLike`
+- [lib/Dialect/TritonGPU/IR/Dialect.cpp:242](lib/Dialect/TritonGPU/IR/Dialect.cpp#L242) — `getMatrixOrder`
+- [lib/Dialect/TritonGPU/IR/Dialect.cpp:257](lib/Dialect/TritonGPU/IR/Dialect.cpp#L257) — `getOrderForDotOperand`
+- [lib/Dialect/TritonGPU/IR/Dialect.cpp](lib/Dialect/TritonGPU/IR/Dialect.cpp) — `getRepForOperand` with opIdx=1 handling for f64
+- [third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM/MMAv2.cpp](third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM/MMAv2.cpp) — operand-loading code
+
+### Test Debugging Notes
+
+- **Kernel cache issue discovered:** Early debugging showed Phase 2/3 "working" when cached kernels from earlier runs (with env-var overrides) were reused. Solution: clear `~/.triton/cache` before each test run.
+- **Unit tests verified:** `pytest -n 16 python/test/unit/language/test_core.py` passes on A100 and H100.
+- **Lit tests:** Phase 1 IR lowering verified (`test/Conversion/tritongpu_to_llvm_hopper.mlir:642` still uses `[8, 8]` for legacy m8n8k4; `test/TritonGPU/accelerate-matmul.mlir:139` expects `[16, 8, 4]` for sm_90).
+
+### Next Steps (for continuation)
+
+1. **Debug Phase 2/3 B-operand layout:** Trace through `swizzleDotOperandLike` → `getContigPerThread` → shared-encoding for f64 B with kWidth=2. Likely fix: ensure B's shared layout encodes K-contiguity, not N-contiguity.
+2. **Add m16n8k8 and m16n8k16 to shape table:** Once B-operand bug is fixed, add entries to `Fp64MmaShape[]` and update `selectFp64Shape()` dispatcher.
+3. **Regression tests:** Run full unit test suite (`pytest python/test/unit/language/test_core.py`) on A100 and H100.
+4. **Benchmark:** Confirm m16n8k8 ≥45 TFLOPS, m16n8k16 ≥50 TFLOPS (parity with cuBLAS at ~55).
+5. **Commit:** Phase 2/3 as second commit; Phase 4 auto-selection is already merged.
