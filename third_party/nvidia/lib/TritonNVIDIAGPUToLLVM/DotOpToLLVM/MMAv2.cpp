@@ -751,16 +751,10 @@ static void callMmaAmpereFp64M16(PTXBuilder &builder, int b,
   auto tb = TritonLLVMOpBuilder(loc, rewriter);
   auto f64Ty = type::f64Ty(rewriter.getContext());
 
-  auto unpackOperand = [&](Value vec, PTXBuilder::Operand *list) {
-    if (kWidth == 1) {
-      // vec<1, f64> — pass directly (matches the Phase 1 lowering exactly).
-      list->listAppend(builder.newOperand(vec, "d"));
-      return;
-    }
-    for (unsigned i = 0; i < kWidth; ++i) {
-      Value elt = tb.extract_element(f64Ty, vec, tb.i32_val(i));
-      list->listAppend(builder.newOperand(elt, "d"));
-    }
+  auto extractAt = [&](Value vec, unsigned i) -> Value {
+    if (kWidth == 1)
+      return vec;
+    return tb.extract_element(f64Ty, vec, tb.i32_val(i));
   };
 
   auto *retArgs = builder.newListOperand(numMmaRets, "=d");
@@ -774,12 +768,24 @@ static void callMmaAmpereFp64M16(PTXBuilder &builder, int b,
         builder.newOperand(fc[cBase + i], std::to_string(i)));
   }
 
+  // PTX m16n8k{4,8,16}.f64 expects A regs ordered as:
+  //   a[2*j+0] = (gid,   K=K_base+j)
+  //   a[2*j+1] = (gid+8, K=K_base+j)
+  // i.e., M alternates fastest, then K. Phase 1 (k4, kWidth=1) is just j=0.
+  // For kWidth>1 we interleave the kWidth elements from each M-vec.
+  Value vec0 = ha[{b, base.m + 0, base.k}];
+  Value vec1 = ha[{b, base.m + 1, base.k}];
   auto *aArgs = builder.newListOperand();
-  unpackOperand(ha[{b, base.m + 0, base.k}], aArgs);
-  unpackOperand(ha[{b, base.m + 1, base.k}], aArgs);
+  for (unsigned j = 0; j < kWidth; ++j) {
+    aArgs->listAppend(builder.newOperand(extractAt(vec0, j), "d"));
+    aArgs->listAppend(builder.newOperand(extractAt(vec1, j), "d"));
+  }
 
+  // PTX b regs are K-adjacent at the same N (gid) — vec0 already in K order.
+  Value vecB = hb[{b, base.n, base.k}];
   auto *bArgs = builder.newListOperand();
-  unpackOperand(hb[{b, base.n, base.k}], bArgs);
+  for (unsigned j = 0; j < kWidth; ++j)
+    bArgs->listAppend(builder.newOperand(extractAt(vecB, j), "d"));
 
   mma(retArgs, aArgs, bArgs, cArgs);
 }
