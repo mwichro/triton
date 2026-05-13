@@ -163,7 +163,11 @@ When vec=2, elements are swizzled in pairs of 2.  In other words, the element at
         int perPhase = std::max<int>(1024 / (bitwidth * K), 1);
 
         int mmaStride = 8;
-        int vec = 4 * kWidth;
+        // Cap vec to fit within one bank cycle (32 bytes) for wide types.
+        // For f64 (bitwidth=64) with kWidth=4: uncapped vec=16 → vec*bitwidth=1024
+        // → maxPhase=1 (no swizzle, bank conflicts). Capping at 256/bitwidth
+        // elements keeps maxPhase ≥ 4 for all dtypes.
+        int vec = std::min((int)(4 * kWidth), std::max(256 / (int)bitwidth, 1));
         // needsTrans is equiv. to flipping the opIdx
         if (needTrans)
           std::swap(vec, mmaStride);

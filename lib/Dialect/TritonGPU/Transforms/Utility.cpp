@@ -50,11 +50,15 @@ static unsigned pickFp64MmaK(int computeCapability, int operandK) {
       return 8;
     return static_cast<unsigned>(envK);
   }
-  // Auto-select: largest K that divides operandK and is supported.
+  // Auto-select: largest K that divides operandK, is supported, and leaves
+  // at least 4 MMA instructions per K-step (repK = BLOCK_K / K_mma >= 4).
+  // Fewer than 4 reps hurts pipelining: the MMA loop body is too thin to
+  // hide shared-memory latency. Concrete thresholds: K=16 needs BLOCK_K>=64,
+  // K=8 needs BLOCK_K>=32; K=4 is always available.
   if (operandK > 0) {
-    if (computeCapability >= 90 && operandK % 16 == 0)
+    if (computeCapability >= 90 && operandK % 16 == 0 && operandK >= 64)
       return 16;
-    if (operandK % 8 == 0)
+    if (operandK % 8 == 0 && operandK >= 32)
       return 8;
   }
   return 4;
