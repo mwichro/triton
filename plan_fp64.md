@@ -316,3 +316,67 @@ The Phase 1 `m16n8k4` work (committed) is unaffected and remains correct.
 3. **Regression tests:** Run full unit test suite (`pytest python/test/unit/language/test_core.py`) on A100 and H100.
 4. **Benchmark:** Confirm m16n8k8 ≥45 TFLOPS, m16n8k16 ≥50 TFLOPS (parity with cuBLAS at ~55).
 5. **Commit:** Phase 2/3 as second commit; Phase 4 auto-selection is already merged.
+
+---
+
+### Phase 2/3 status update (2026-05-14)
+
+**Numerical bug: FIXED.** m16n8k8 and m16n8k16 now produce correct results
+(verified by the `torch.allclose` check at the head of `fp64mma_test.py`).
+
+**Performance: NO IMPROVEMENT over Phase 1.** End-to-end H100 sweep with
+the "full implementation" branch (k4 + k8 + k16 all enabled and
+selectable) lands within benchmark noise of the Phase-1-only result:
+
+    size 4096:  Phase-1 only  50.18  →  full impl  50.18 TFLOPS
+    size 2048:  Phase-1 only  52.57  →  full impl  51.73 TFLOPS
+    size 1280:  Phase-1 only  40.14  →  full impl  39.99 TFLOPS
+
+cuBLAS sits ~5–8% above Triton across the sweep (e.g. 56.7 vs 50.2 at
+4096), unchanged from Phase 1.
+
+**Why larger MMAs didn't help — diagnosed via forced-K sweep**
+(`bench_fp64_focus.py` with `TRITON_FP64_MMA_K ∈ {4, 8, 16}`):
+
+    K=4   @2048:  52.06 TFLOPS, winning cfg BLOCK_K=16, nw=2
+    K=8   @2048:  52.20 TFLOPS, winning cfg BLOCK_K=16, nw=2  (→ falls back to k4: repK guard)
+    K=16  @2048:  51.62 TFLOPS, winning cfg BLOCK_K=16, nw=2  (env override forces k16, no speedup)
+
+Two reinforcing reasons:
+
+1. **Autotuner picks small BLOCK_K.** With the current config list, every
+   problem size selects BLOCK_K=16. The `repK ≥ 4` guard in
+   `pickFp64MmaK` then auto-downgrades to k4. So in the default path,
+   "full implementation" never actually emits k8/k16.
+2. **Even when k16 is forced via env var, throughput is unchanged.** The
+   MMA instruction shape is not the bottleneck at this BLOCK_K. One fat
+   m16n8k16 vs four thin m16n8k4 per K-step deliver the same TFLOPS.
+
+**What this means for the gap.** The remaining ~5–8% gap to cuBLAS is
+**not** unlockable by:
+
+- larger autotune search space at the block-tile level (exhausted: 80/96
+  tiles are not pow-2 so disallowed by `tl.arange`; 128-tile variants
+  added but don't win),
+- larger MMA shapes (Phase 2/3 done, no measurable effect),
+- `num_warps` tuning (nw=2 already wins; nw={4,8} configs lose).
+
+The bottleneck has moved upstream of the MMA pipe. For FP64, A is loaded
+as `ld.shared.v2.b64` (vector) but B uses scalar `ld.shared.b64`
+(no `ldmatrix` variant exists for f64). The likely remaining levers are:
+
+- **Shared-memory swizzle for B** at `kWidth>1` — verify `getSharedEncoding`
+  produces a B layout that vectorizes correctly with the new kTile, and
+  that bank-conflict patterns match cuBLAS. The "Risks #3" item is the
+  real next step despite the earlier docstring claim to the contrary.
+- **Async-pipeline depth / cp.async scheduling** for the B operand —
+  cuBLAS likely overlaps B loads with compute differently.
+- **Profile-driven diagnosis:** an NCU run on size=2048 or 4096 to
+  determine whether the kernel is MIO-throttled (shared-load bound, fixable)
+  vs MMA-pipe bound (fundamental, gap is closed).
+
+**Recommendation:** Do not invest further effort in MMA-shape work or
+autotune-config expansion. Either (a) profile under Nsight Compute and
+chase the B-operand shared-load path, or (b) declare Phase 2/3
+mechanically done and accept the residual gap as a hardware-limited
+artifact of f64 lacking `ldmatrix`.
