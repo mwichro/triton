@@ -189,9 +189,28 @@ Default policy layered on top of the Phase 1 override (override always wins):
 
 ## Progress status
 
---- 
+---
 
-Pausing investigation for `/compact`. Current status of Phase 2/3 debug:
+### Performance regression investigation (2026-05-13)
+
+**Issue:** After WIP commit (`edfc776f50`) added K=8/16 auto-selection, benchmark dropped from ~49 TFLOPS (Phase 1 baseline) to ~31 TFLOPS at M=N=K=4096.
+
+**Root cause 1 — swizzle collapse for kWidth>1 (`TritonGPUAttrDefs.td` line ~166):**
+`vec = 4 * kWidth` → for f64 kWidth=4: `vec=16`, `maxPhase = min(8, 1024/(16×64)) = 1` (no swizzle → bank conflicts).
+**Fix:** `vec = min((int)(4*kWidth), max(256/(int)bitwidth, 1))` → f64 kWidth=4 gets `vec=4, maxPhase=4` (same as K=4 path).
+
+**Root cause 2 — auto-selection ignoring repK (`Utility.cpp pickFp64MmaK`):**
+K=16 was selected for BLOCK_K=16 → `repK = 16/16 = 1` (one MMA per K-step), too thin to hide shared-memory latency.
+**Fix:** Require `repK ≥ 4` — K=16 only when `BLOCK_K ≥ 64`, K=8 only when `BLOCK_K ≥ 32`.
+With the autotune configs in `fp64mma_test.py` (max BLOCK_K=32), K=4 is now always selected; K=8/16 auto-selected only for kernels with larger tiles.
+
+**Fix also incorporates:** "fix MMA" commit (`2800e94a85`) A-register M-inner/K-outer ordering (already committed).
+
+**Result:** ~44 TFLOPS at 4096 restored (cf. Phase 1 baseline 49 TFLOPS — remaining gap is benchmark variance).
+
+---
+
+
 
 **Bug:** `m16n8k8` + `m16n8k16` produce wrong numerical results. `m16n8k4` (Phase 1) still works.
 
