@@ -1,16 +1,23 @@
 # FP64 residual perf gap — B-operand shared-layout investigation
 
-> **Status as of 2026-05-14:** investigation complete through PTX-level
+> **Status as of 2026-05-15:** investigation complete through PTX-level
 > diagnosis. No code changes attempted yet. This document is the
 > resumption-ready record — read it end-to-end before touching code.
+>
+> **Correction (2026-05-15):** the earlier "BLOCK_K≥32 is ~30% slower"
+> figure from `bench_fp64_layer1_probe.py` did not reproduce on rerun.
+> The kWidth≥2 path is **modestly behind** (1–3% at size=2048), not
+> pathologically broken. The PTX/TTGIR root-cause diagnosis below
+> (scalar B loads, N-contig shared encoding) still holds — the magnitude
+> claim was the part that was wrong.
 
 ## TL;DR
 
 - Phase 1 (`m16n8k4`) reaches ~50 TFLOPS on H100 — within 5–8% of cuBLAS.
 - Phase 2/3 (`m16n8k8` / `m16n8k16`) are **numerically correct** but the
-  autotuner never picks them, because BLOCK_K≥32 configs are ~30% *slower*
-  than BLOCK_K=16. Bigger MMAs should help compute throughput — the loss
-  is unambiguously in the operand-feed pipeline.
+  autotuner picks BLOCK_K=16 anyway. Bigger MMAs *should* help compute
+  throughput; they don't, which still points at the operand-feed pipeline
+  — just with a smaller headroom than initially measured.
 - **Root cause (PTX-confirmed):** B operand at `kWidth ≥ 2` is loaded as
   **two scalar `ld.shared.b64`** per thread (instead of one
   `ld.shared.v2.b64`). The two K-adjacent B elements per thread sit at
@@ -23,15 +30,23 @@
   the elements being loaded aren't adjacent. The real fix is to construct
   B's shared encoding with `order=[0,1]` (K-contiguous) when `kWidth≥2`
   for f64, which means physically transposing B during global→shared.
-- **This is not hardware-limited** (cuBLAS does it on the same H100). It
-  is, however, deeper work than first estimated: ~150–400 lines spanning
-  3–5 files, plus pipeliner coordination so `cp.async` still works.
+- **User-space workaround does not work.** Passing B with K-contig global
+  strides (`b.T.contiguous().T`, stride `(1, K)`) gives +0.5–2.5% at
+  size=2048, within noise. `getOrderForMemory` does follow global stride,
+  but the dot-operand lowering at kWidth≥2 does not vectorize even when
+  global is K-contig. See "User-space probe" section below.
+- **This is not hardware-limited** (cuBLAS does it on the same H100). The
+  expected win is modest though — closing a 5–8% gap, not a 30% one —
+  so the cost/benefit of the ~150–400 line Layer 3 implementation is
+  weaker than originally estimated.
 
 ## Evidence (don't re-derive — captured here)
 
-### Bench probe: kWidth=2 path is pathological
+### Bench probe: kWidth=2 path is modestly behind, not pathological
 
-`bench_fp64_layer1_probe.py` splits the autotune list and benchmarks each:
+`bench_fp64_layer1_probe.py` splits the autotune list and benchmarks each.
+
+**Original measurement (2026-05-14, did not reproduce on rerun):**
 
 | Size | BLOCK_K≤16 (kWidth=1) | BLOCK_K≥32 (kWidth=2) | Δ |
 |------|-----------------------|------------------------|---|
@@ -39,8 +54,41 @@
 | 2048 | 51.61 (cu 54.5, gap 5%) | 37.37 (gap 33%) | **−28%** |
 | 4096 | 50.72 (cu 54.4, gap 7%) | 39.45 (gap 35%) | **−22%** |
 
-Winning BLOCK_K=32 config at 2048: `BM=64, BN=64, BK=32, nw=2, ns=3`.
-m16n8k8 is being emitted (instrShape=[16,8,8]).
+**Rerun (2026-05-15, size=2048 only, via `bench_fp64_b_colmajor_probe.py`
+row-major arm):**
+
+| Size | BLOCK_K≤16 | BLOCK_K≥32 | Δ |
+|------|------------|------------|---|
+| 2048 | 52.23 (cu 56.87, gap 8.1%) | 51.15 (cu 55.94, gap 8.6%) | **−2.1%** |
+
+The original 28% collapse was likely a measurement artifact (stale
+autotune cache or one-off thermal/sharing effect on the GPU). The
+*real* gap is ~1–3% at size=2048, both BLOCK_K subsets sitting at
+~52 TFLOPS with an ~8% gap to cuBLAS. **The cuBLAS gap is the actual
+problem — not a kWidth=2-specific collapse.**
+
+Winning BLOCK_K=32 config at 2048: `BM=64, BN=64, BK=32, nw=4, ns=3`
+(was `nw=2` in the original; another sign the original autotune state
+was unstable). m16n8k8 is being emitted (instrShape=[16,8,8]).
+
+### User-space probe: B as K-contig global
+
+`bench_fp64_b_colmajor_probe.py` re-runs both BLOCK_K subsets at
+size=2048 with B passed as `torch.randn((N,K)).t()` — physical N×K
+row-major, logical K×N with stride `(1, K)`. This makes
+`getOrderForMemory(B)` return `[0, 1]` instead of `[1, 0]`.
+
+| Subset | B row-major | B col-major (K-contig) | Δ |
+|---|---|---|---|
+| BLOCK_K≤16 | 52.23 | 53.55 | +2.5% |
+| BLOCK_K≥32 | 51.15 | 51.42 | +0.5% |
+
+Within noise. The compiler accepts the K-contig global layout (no
+correctness failure, autotuner picks similar configs), but the
+dot-operand lowering at kWidth≥2 doesn't visibly switch to vectorized
+shared loads. This means the **"make transpose the user's responsibility"**
+idea is not viable as a workaround — the compiler-side fix is required
+to get any meaningful speedup.
 
 ### Forced-K sweep (`bench_fp64_focus.py`)
 
@@ -98,7 +146,9 @@ Same dump, `matmul_kernel_fp64.ttgir`:
 K-contiguous, good. For B (K×N) axis-1 is N → **B is N-contiguous**,
 which is the wrong axis for the m16n8k8 B-operand fragment (PTX wants
 K-adjacent register pairs). Two K-adjacent elements are at stride-N=32
-in shared memory → cannot vectorize → scalar loads → 30% perf loss.
+in shared memory → cannot vectorize → scalar loads. The structural
+issue is real; the empirical magnitude is the residual ~5–8% cuBLAS gap,
+not the 28% claimed earlier.
 
 ### Swizzle-math sanity (Layer 1 is inert here)
 
@@ -234,20 +284,25 @@ is not the path to chase.
 ## Why the current state is *not* a regression
 
 - The autotuner in `fp64mma_test.py` selects `BLOCK_K=16` (kWidth=1) at
-  every size, which routes to the m16n8k4 path that doesn't hit the
-  layout pathology.
+  most sizes (BLOCK_K=32 wins at some). Both subsets land near
+  ~52 TFLOPS at size=2048, both ~8% behind cuBLAS.
 - End-to-end Triton TFLOPS at size 4096: ~50, vs cuBLAS ~57 (~12% gap).
-- The 30% kWidth=2 collapse is invisible to the headline number, only
-  exposed by forcing BLOCK_K≥32.
-- So "doing nothing" leaves us at the Phase 1 result. Fixing Layer 3
-  unlocks BLOCK_K≥32 winning, which *should* close the cuBLAS gap.
+- Phase 2/3 are correct but don't materially shift the headline number
+  — the bigger MMAs don't help because the operand-feed pipeline is
+  the bottleneck, not MMA throughput.
+- "Doing nothing" leaves us at the Phase 1 result with a 5–12% cuBLAS
+  gap (size-dependent). Fixing Layer 3 *should* close some of this,
+  but the upside is bounded by the gap itself — there isn't a hidden
+  30% to recover.
 
 ## Resumption checklist (start here next session)
 
 1. **Re-read this document.** Sanity-check by re-running
-   `bench_fp64_layer1_probe.py` — the ~30% gap on BLOCK_K≥32 should still
-   reproduce. If it doesn't, something upstream changed; re-investigate
-   before touching code.
+   `bench_fp64_layer1_probe.py` and `bench_fp64_b_colmajor_probe.py`.
+   Expect BLOCK_K≤16 and BLOCK_K≥32 to both land ~52 TFLOPS at size=2048
+   with ~8% gap to cuBLAS, and the col-major arm to give ≤+3%. If the
+   numbers diverge wildly, the autotune cache is unstable — clear it and
+   rerun before drawing conclusions.
 2. **Decide path:**
    - **(a) Implement Layer 3 (then 2, then 1).** Highest reward, deepest
      work. Start by reading the construction site at Utility.cpp:1225,
@@ -301,6 +356,9 @@ is not the path to chase.
 - `dump_bk32_ptx.py` — restricts autotune to BLOCK_K=32 configs,
   runs once at size=2048 so `TRITON_KERNEL_DUMP=1 TRITON_DUMP_DIR=...`
   emits the .ptx/.ttgir/.sass artifacts to inspect.
+- `bench_fp64_b_colmajor_probe.py` — runs both BLOCK_K subsets with B
+  in row-major *and* col-major (K-contig global) global layouts.
+  Confirms the user-space transpose workaround is within noise.
 
 ## Artifacts to preserve (git add list)
 
@@ -346,8 +404,10 @@ edits in Layer 2/3 must preserve this — re-run after every rebuild.
 2. **TTGIR check:** `#shared1` for B should show `order=[0, 1]` (or
    whatever K-inner equivalent) when kWidth≥2.
 3. **Probe sanity:** `bench_fp64_layer1_probe.py` BLOCK_K≥32 path must
-   reach ≥52 TFLOPS at size=2048 (matching or beating BLOCK_K=16). If
-   it doesn't, stop and re-diagnose — fix isn't doing what it claims.
+   beat the current ~51 TFLOPS at size=2048 by a margin clearly outside
+   noise (target ≥54 TFLOPS, matching cuBLAS within 3%). If it merely
+   ties the BLOCK_K=16 path again, the fix didn't change the load
+   pattern — re-diagnose via PTX dump before claiming success.
 4. **Numerical correctness:** `torch.allclose` ✅; full
    `pytest python/test/unit/language/test_core.py -k dot` on A100 + H100.
 5. **NCU:** DMMA-pipe utilization ≥80% at size=2048; long-scoreboard
