@@ -107,14 +107,13 @@ public:
   }
 };
 
+// Returns true when `op` is a floating-point add — used to identify the
+// combine body of a sum-reduction.
+static bool isAddFloat(const Operation *op) { return isa<arith::AddFOp>(op); }
+
 // sum(x[:, :, None] * y[None, :, :], 1)
 // -> dot(x, y)
 class CombineBroadcastMulReducePattern : public RewritePattern {
-private:
-  static bool isAddFloat(const Operation *op) {
-    return isa<arith::AddFOp>(op);
-  }
-
 public:
   CombineBroadcastMulReducePattern(MLIRContext *context)
       : RewritePattern(ReduceOp::getOperationName(), 1, context) {}
@@ -167,11 +166,11 @@ public:
     Type newAccType = RankedTensorType::get(
         {broadcastLhsShape[0], broadcastRhsShape[2]}, elemType);
     rewriter.setInsertionPoint(op);
-    auto zeroAttr = FloatAttr::get(elemType, 0.0);
     auto newAcc =
         SplatOp::create(rewriter, op->getLoc(), newAccType,
-                        arith::ConstantOp::create(rewriter, op->getLoc(),
-                                                  zeroAttr));
+                        arith::ConstantOp::create(
+                            rewriter, op->getLoc(),
+                            rewriter.getFloatAttr(elemType, 0.0)));
     rewriter.replaceOpWithNewOp<DotOp>(op, expandLhsOp.getSrc(),
                                        expandRhsOp.getSrc(), newAcc,
                                        InputPrecision::IEEE, 0);
@@ -193,8 +192,6 @@ public:
 // single tt.dot after appropriate reshapes.
 class CombineBroadcastMulReduceToMatmulPattern : public RewritePattern {
 private:
-  static bool isAddFloat(const Operation *op) { return isa<arith::AddFOp>(op); }
-
   struct MatchResult {
     Value lhsSrc;      // shape: (batch..., 1, K)
     Value rhsSrc;      // shape: (1,...,1, N, K)
@@ -330,8 +327,8 @@ public:
 
     // Accumulator: zeros of shape (effectiveBatch, N).
     auto accType = RankedTensorType::get({effectiveBatch, N}, elemType);
-    auto zeroAttr = FloatAttr::get(elemType, 0.0);
-    auto zeroVal = arith::ConstantOp::create(rewriter, loc, zeroAttr);
+    auto zeroVal = arith::ConstantOp::create(
+        rewriter, loc, rewriter.getFloatAttr(elemType, 0.0));
     auto acc = SplatOp::create(rewriter, loc, accType, zeroVal);
 
     // Emit the dot: (effectiveBatch, K) * (K, N) -> (effectiveBatch, N).
