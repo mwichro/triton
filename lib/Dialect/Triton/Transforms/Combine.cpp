@@ -111,10 +111,8 @@ public:
 // -> dot(x, y)
 class CombineBroadcastMulReducePattern : public RewritePattern {
 private:
-  static bool isAddF32(const Operation *op) {
-    if (auto addf = dyn_cast_or_null<arith::AddFOp>(op))
-      return addf.getType().getIntOrFloatBitWidth() <= 32;
-    return false;
+  static bool isAddFloat(const Operation *op) {
+    return isa<arith::AddFOp>(op);
   }
 
 public:
@@ -126,11 +124,11 @@ public:
     auto reduceOp = llvm::dyn_cast<ReduceOp>(op);
     if (!reduceOp)
       return failure();
-    // only support reduce with simple addition
+    // only support reduce with simple addition of floats
     Region &combineOp = reduceOp.getCombineOp();
     bool isReduceAdd = combineOp.hasOneBlock() &&
                        combineOp.front().getOperations().size() == 2 &&
-                       isAddF32(&*combineOp.front().getOperations().begin());
+                       isAddFloat(&*combineOp.front().getOperations().begin());
     if (!isReduceAdd)
       return failure();
     // operand of reduce has to be mul
@@ -160,19 +158,191 @@ public:
         cast<ShapedType>(broadcastLhsOp.getType()).getShape();
     auto broadcastRhsShape =
         cast<ShapedType>(broadcastRhsOp.getType()).getShape();
-    if (broadcastLhsShape[2] < 16 || broadcastRhsShape[0] < 16)
+    // For FP64 MMA (m8n8k4 on A100) allow sizes down to 8; otherwise use 16.
+    auto elemType =
+        cast<ShapedType>(broadcastLhsOp.getSrc().getType()).getElementType();
+    int64_t minSize = elemType.isF64() ? 8 : 16;
+    if (broadcastLhsShape[2] < minSize || broadcastRhsShape[0] < minSize)
       return failure();
     Type newAccType = RankedTensorType::get(
-        {broadcastLhsShape[0], broadcastRhsShape[2]},
-        cast<ShapedType>(broadcastLhsOp.getSrc().getType()).getElementType());
+        {broadcastLhsShape[0], broadcastRhsShape[2]}, elemType);
     rewriter.setInsertionPoint(op);
+    auto zeroAttr = FloatAttr::get(elemType, 0.0);
     auto newAcc =
         SplatOp::create(rewriter, op->getLoc(), newAccType,
                         arith::ConstantOp::create(rewriter, op->getLoc(),
-                                                  rewriter.getF32FloatAttr(0)));
+                                                  zeroAttr));
     rewriter.replaceOpWithNewOp<DotOp>(op, expandLhsOp.getSrc(),
                                        expandRhsOp.getSrc(), newAcc,
                                        InputPrecision::IEEE, 0);
+    return success();
+  }
+};
+
+// sum(u[:, :, :, None, :] * W[None, None, None, :, :], last_axis)
+// -> reshape(dot(reshape(u, [B, K]), trans(W, [1, 0])), [batch..., N])
+//
+// This handles the batched contraction pattern where:
+//   u  has shape (batch..., K),   expanded at axis R-2 to (batch..., 1, K)
+//   W  has shape (1,...,1, N, K), batch dims all 1
+//   reduce is over the last axis (K)
+// Result: (batch..., N)
+//
+// This avoids materialising the large intermediate product tensor
+// (batch..., N, K) in registers.  Instead the contraction is emitted as a
+// single tt.dot after appropriate reshapes.
+class CombineBroadcastMulReduceToMatmulPattern : public RewritePattern {
+private:
+  static bool isAddFloat(const Operation *op) { return isa<arith::AddFOp>(op); }
+
+  struct MatchResult {
+    Value lhsSrc;      // shape: (batch..., 1, K)
+    Value rhsSrc;      // shape: (1,...,1, N, K)
+    int64_t N, K;
+    int batchRank;
+    int64_t batchTotal;
+  };
+
+  // Try to match with a specific assignment of lhs/rhs broadcast operands.
+  // lhsBroadcast must be the "u" side (batch dims present, size-1 at R-2).
+  // rhsBroadcast must be the "W" side (all batch dims == 1).
+  static std::optional<MatchResult>
+  tryMatchOrdered(BroadcastOp lhsBroadcast, BroadcastOp rhsBroadcast, int R,
+                  ArrayRef<int64_t> broadcastShape) {
+    int batchRank = R - 2;
+    int64_t N = broadcastShape[R - 2];
+    int64_t K = broadcastShape[R - 1];
+
+    // LHS src: (batch..., 1, K) -- size 1 at axis R-2, batch dims match
+    auto lhsSrcShape =
+        cast<RankedTensorType>(lhsBroadcast.getSrc().getType()).getShape();
+    if (static_cast<int>(lhsSrcShape.size()) != R)
+      return std::nullopt;
+    for (int i = 0; i < batchRank; i++)
+      if (lhsSrcShape[i] != broadcastShape[i])
+        return std::nullopt;
+    if (lhsSrcShape[R - 2] != 1 || lhsSrcShape[R - 1] != K)
+      return std::nullopt;
+
+    // RHS src: (1,...,1, N, K) -- all batch dims must be 1
+    auto rhsSrcShape =
+        cast<RankedTensorType>(rhsBroadcast.getSrc().getType()).getShape();
+    if (static_cast<int>(rhsSrcShape.size()) != R)
+      return std::nullopt;
+    for (int i = 0; i < batchRank; i++)
+      if (rhsSrcShape[i] != 1)
+        return std::nullopt;
+    if (rhsSrcShape[R - 2] != N || rhsSrcShape[R - 1] != K)
+      return std::nullopt;
+
+    int64_t batchTotal = 1;
+    for (int i = 0; i < batchRank; i++)
+      batchTotal *= broadcastShape[i];
+
+    return MatchResult{lhsBroadcast.getSrc(), rhsBroadcast.getSrc(), N, K,
+                       batchRank, batchTotal};
+  }
+
+public:
+  CombineBroadcastMulReduceToMatmulPattern(MLIRContext *context)
+      : RewritePattern(ReduceOp::getOperationName(), 1, context) {}
+
+  LogicalResult matchAndRewrite(Operation *op,
+                                PatternRewriter &rewriter) const override {
+    auto reduceOp = dyn_cast<ReduceOp>(op);
+    if (!reduceOp)
+      return failure();
+
+    // Only support reduce with simple float addition.
+    Region &combineRegion = reduceOp.getCombineOp();
+    if (!combineRegion.hasOneBlock() ||
+        combineRegion.front().getOperations().size() != 2 ||
+        !isAddFloat(&*combineRegion.front().getOperations().begin()))
+      return failure();
+
+    if (reduceOp.getNumOperands() != 1)
+      return failure();
+
+    auto inputType =
+        dyn_cast<RankedTensorType>(reduceOp.getOperand(0).getType());
+    if (!inputType)
+      return failure();
+
+    int R = inputType.getRank();
+    if (R < 2)
+      return failure();
+
+    // Only handle reduce over the last axis.
+    if (reduceOp.getAxis() != R - 1)
+      return failure();
+
+    // Require floating-point element type.
+    auto elemType = inputType.getElementType();
+    if (!isa<FloatType>(elemType))
+      return failure();
+
+    // The operand of reduce must be a mul.
+    auto mulOp = reduceOp.getOperand(0).getDefiningOp<arith::MulFOp>();
+    if (!mulOp)
+      return failure();
+
+    // Both mul operands must come from BroadcastOp.
+    auto op0 = mulOp.getOperand(0).getDefiningOp<BroadcastOp>();
+    auto op1 = mulOp.getOperand(1).getDefiningOp<BroadcastOp>();
+    if (!op0 || !op1)
+      return failure();
+
+    auto broadcastShape = inputType.getShape();
+
+    // Try both orderings: (u=op0, W=op1) and (u=op1, W=op0).
+    std::optional<MatchResult> match = tryMatchOrdered(op0, op1, R, broadcastShape);
+    if (!match)
+      match = tryMatchOrdered(op1, op0, R, broadcastShape);
+    if (!match)
+      return failure();
+
+    auto [lhsSrc, rhsSrc, N, K, batchRank, batchTotal] = *match;
+
+    // Minimum size check for dot to be beneficial.
+    // FP64 MMA on SM80/SM90 uses m8n8k4, so require N>=8 and K>=4.
+    // For other types use conservative thresholds matching tl.dot expectations.
+    int64_t minN = elemType.isF64() ? 8 : 16;
+    int64_t minK = elemType.isF64() ? 4 : 16;
+    if (N < minN || K < minK || batchTotal < 1)
+      return failure();
+
+    auto loc = op->getLoc();
+
+    // Flatten lhsSrc from (batch..., 1, K) to (batchTotal, K).
+    // This squeezes the size-1 dim at R-2 and flattens any batch dims.
+    int64_t effectiveBatch = (batchRank == 0) ? 1 : batchTotal;
+    auto lhs2d = ReshapeOp::create(rewriter, loc,
+                                   SmallVector<int64_t>{effectiveBatch, K},
+                                   lhsSrc);
+
+    // Reshape rhsSrc from (1,...,1, N, K) to (N, K), stripping leading 1s.
+    auto rhsFlat =
+        ReshapeOp::create(rewriter, loc, SmallVector<int64_t>{N, K}, rhsSrc);
+
+    // Transpose rhsFlat from (N, K) to (K, N).
+    auto rhsT = TransOp::create(rewriter, loc, rhsFlat,
+                                SmallVector<int32_t>{1, 0});
+
+    // Accumulator: zeros of shape (effectiveBatch, N).
+    auto accType = RankedTensorType::get({effectiveBatch, N}, elemType);
+    auto zeroAttr = FloatAttr::get(elemType, 0.0);
+    auto zeroVal = arith::ConstantOp::create(rewriter, loc, zeroAttr);
+    auto acc = SplatOp::create(rewriter, loc, accType, zeroVal);
+
+    // Emit the dot: (effectiveBatch, K) * (K, N) -> (effectiveBatch, N).
+    auto result2d =
+        DotOp::create(rewriter, loc, lhs2d, rhsT, acc, InputPrecision::IEEE, 0);
+
+    // Reshape result from (effectiveBatch, N) back to (batch..., N).
+    SmallVector<int64_t> resultShape(broadcastShape.begin(),
+                                     broadcastShape.begin() + batchRank);
+    resultShape.push_back(N);
+    rewriter.replaceOpWithNewOp<ReshapeOp>(op, resultShape, result2d);
     return success();
   }
 };
@@ -291,6 +461,7 @@ public:
     patterns.add<CombineSelectMaskedLoadPattern>(context);
     patterns.add<CombineAddPtrPattern>(context);
     patterns.add<CombineBroadcastMulReducePattern>(context);
+    patterns.add<CombineBroadcastMulReduceToMatmulPattern>(context);
     patterns.add<CombineReshapeReducePatterns>(context);
     patterns.add<RankedReduceDescriptorLoads>(context);
 

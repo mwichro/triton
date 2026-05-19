@@ -491,3 +491,88 @@ tt.func @test_combine_broadcast_mul_reduce(%arg0: tensor<32x16xf32>, %arg1: tens
     }) : (tensor<32x16x32xf32>) -> tensor<32x32xf32>
     tt.return %5 : tensor<32x32xf32>
 }
+
+// CHECK-LABEL: @test_combine_broadcast_mul_reduce_f64
+// Test that the existing 3-D pattern also fires for FP64 types.
+tt.func @test_combine_broadcast_mul_reduce_f64(%arg0: tensor<32x16xf64>, %arg1: tensor<16x32xf64>) -> tensor<32x32xf64> {
+    // CHECK: %[[CST:.*]] = arith.constant dense<0.000000e+00> : tensor<32x32xf64>
+    // CHECK: %[[RES:.*]] = tt.dot %{{.*}}, %{{.*}}, %[[CST]] : tensor<32x16xf64> * tensor<16x32xf64> -> tensor<32x32xf64>
+    // CHECK: tt.return %[[RES]] : tensor<32x32xf64>
+    %0 = tt.expand_dims %arg0 {axis = 2 : i32} : tensor<32x16xf64> -> tensor<32x16x1xf64>
+    %1 = tt.broadcast %0 : tensor<32x16x1xf64> -> tensor<32x16x32xf64>
+    %2 = tt.expand_dims %arg1 {axis = 0 : i32} : tensor<16x32xf64> -> tensor<1x16x32xf64>
+    %3 = tt.broadcast %2 : tensor<1x16x32xf64> -> tensor<32x16x32xf64>
+    %4 = arith.mulf %1, %3 : tensor<32x16x32xf64>
+    %5 = "tt.reduce"(%4) <{axis = 1 : i32}> ({
+    ^bb0(%arg2: f64, %arg3: f64):
+        %6 = arith.addf %arg2, %arg3 : f64
+        tt.reduce.return %6 : f64
+    }) : (tensor<32x16x32xf64>) -> tensor<32x32xf64>
+    tt.return %5 : tensor<32x32xf64>
+}
+
+// CHECK-LABEL: @test_combine_batched_broadcast_mul_reduce_to_matmul
+// Test the batched FEM pattern: einsum("beabk,nk->bean", u, W).
+// u: (4, 8, 8, 8), W: (16, 8) => result: (4, 8, 8, 16)
+tt.func @test_combine_batched_broadcast_mul_reduce_to_matmul(%u: tensor<4x8x8x8xf64>, %W: tensor<16x8xf64>) -> tensor<4x8x8x16xf64> {
+    // CHECK: tt.reshape %{{.*}} : tensor<4x8x8x1x8xf64> -> tensor<256x8xf64>
+    // CHECK: tt.reshape %{{.*}} : tensor<1x1x1x16x8xf64> -> tensor<16x8xf64>
+    // CHECK: tt.trans %{{.*}} {order = array<i32: 1, 0>} : tensor<16x8xf64> -> tensor<8x16xf64>
+    // CHECK: arith.constant dense<0.000000e+00> : tensor<256x16xf64>
+    // CHECK: tt.dot {{.*}} : tensor<256x8xf64> * tensor<8x16xf64> -> tensor<256x16xf64>
+    // CHECK: tt.reshape %{{.*}} : tensor<256x16xf64> -> tensor<4x8x8x16xf64>
+    %0 = tt.expand_dims %u {axis = 3 : i32} : tensor<4x8x8x8xf64> -> tensor<4x8x8x1x8xf64>
+    %1 = tt.broadcast %0 : tensor<4x8x8x1x8xf64> -> tensor<4x8x8x16x8xf64>
+    %2 = tt.expand_dims %W {axis = 0 : i32} : tensor<16x8xf64> -> tensor<1x16x8xf64>
+    %3 = tt.expand_dims %2 {axis = 0 : i32} : tensor<1x16x8xf64> -> tensor<1x1x16x8xf64>
+    %4 = tt.expand_dims %3 {axis = 0 : i32} : tensor<1x1x16x8xf64> -> tensor<1x1x1x16x8xf64>
+    %5 = tt.broadcast %4 : tensor<1x1x1x16x8xf64> -> tensor<4x8x8x16x8xf64>
+    %6 = arith.mulf %1, %5 : tensor<4x8x8x16x8xf64>
+    %7 = "tt.reduce"(%6) <{axis = 4 : i32}> ({
+    ^bb0(%arg2: f64, %arg3: f64):
+        %8 = arith.addf %arg2, %arg3 : f64
+        tt.reduce.return %8 : f64
+    }) : (tensor<4x8x8x16x8xf64>) -> tensor<4x8x8x16xf64>
+    tt.return %7 : tensor<4x8x8x16xf64>
+}
+
+// CHECK-LABEL: @test_combine_batched_broadcast_mul_reduce_operands_swapped
+// Same as above but with mul operands in the reverse order.
+tt.func @test_combine_batched_broadcast_mul_reduce_operands_swapped(%u: tensor<4x8x8x8xf64>, %W: tensor<16x8xf64>) -> tensor<4x8x8x16xf64> {
+    // CHECK: tt.dot {{.*}} : tensor<256x8xf64> * tensor<8x16xf64> -> tensor<256x16xf64>
+    // CHECK: tt.reshape %{{.*}} : tensor<256x16xf64> -> tensor<4x8x8x16xf64>
+    %0 = tt.expand_dims %u {axis = 3 : i32} : tensor<4x8x8x8xf64> -> tensor<4x8x8x1x8xf64>
+    %1 = tt.broadcast %0 : tensor<4x8x8x1x8xf64> -> tensor<4x8x8x16x8xf64>
+    %2 = tt.expand_dims %W {axis = 0 : i32} : tensor<16x8xf64> -> tensor<1x16x8xf64>
+    %3 = tt.expand_dims %2 {axis = 0 : i32} : tensor<1x16x8xf64> -> tensor<1x1x16x8xf64>
+    %4 = tt.expand_dims %3 {axis = 0 : i32} : tensor<1x1x16x8xf64> -> tensor<1x1x1x16x8xf64>
+    %5 = tt.broadcast %4 : tensor<1x1x1x16x8xf64> -> tensor<4x8x8x16x8xf64>
+    // Operands swapped vs. the previous test:
+    %6 = arith.mulf %5, %1 : tensor<4x8x8x16x8xf64>
+    %7 = "tt.reduce"(%6) <{axis = 4 : i32}> ({
+    ^bb0(%arg2: f64, %arg3: f64):
+        %8 = arith.addf %arg2, %arg3 : f64
+        tt.reduce.return %8 : f64
+    }) : (tensor<4x8x8x16x8xf64>) -> tensor<4x8x8x16xf64>
+    tt.return %7 : tensor<4x8x8x16xf64>
+}
+
+// CHECK-LABEL: @test_combine_batched_broadcast_mul_reduce_no_match_wrong_axis
+// Reduce over non-last axis should NOT match the new pattern.
+tt.func @test_combine_batched_broadcast_mul_reduce_no_match_wrong_axis(%u: tensor<4x8x8x8xf64>, %W: tensor<16x8xf64>) -> tensor<4x8x16xf64> {
+    // CHECK-NOT: tt.dot
+    %0 = tt.expand_dims %u {axis = 3 : i32} : tensor<4x8x8x8xf64> -> tensor<4x8x8x1x8xf64>
+    %1 = tt.broadcast %0 : tensor<4x8x8x1x8xf64> -> tensor<4x8x8x16x8xf64>
+    %2 = tt.expand_dims %W {axis = 0 : i32} : tensor<16x8xf64> -> tensor<1x16x8xf64>
+    %3 = tt.expand_dims %2 {axis = 0 : i32} : tensor<1x16x8xf64> -> tensor<1x1x16x8xf64>
+    %4 = tt.expand_dims %3 {axis = 0 : i32} : tensor<1x1x16x8xf64> -> tensor<1x1x1x16x8xf64>
+    %5 = tt.broadcast %4 : tensor<1x1x1x16x8xf64> -> tensor<4x8x8x16x8xf64>
+    %6 = arith.mulf %1, %5 : tensor<4x8x8x16x8xf64>
+    // Reduce over axis 3 (not the last axis=4), so pattern should not match.
+    %7 = "tt.reduce"(%6) <{axis = 3 : i32}> ({
+    ^bb0(%arg2: f64, %arg3: f64):
+        %8 = arith.addf %arg2, %arg3 : f64
+        tt.reduce.return %8 : f64
+    }) : (tensor<4x8x8x16x8xf64>) -> tensor<4x8x16xf64>
+    tt.return %7 : tensor<4x8x16xf64>
+}
