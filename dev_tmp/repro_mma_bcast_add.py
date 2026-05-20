@@ -11,7 +11,7 @@ same final dot. Both K=4, N=8 → F64 MMA 8×8×4 tile hit exactly (no padding w
 What the A-vs-B gap measures: the **incremental** cost of the MMA→Blocked round-trip
 the compiler is forced to insert because the bcast-mul-add operand is in BlockedEncoding
 while the dot result is in MmaEncoding. The reshape/permute/split scaffold below the
-add lives in BlockedEncoding in both kernels, so its convert cost cancels in the A−B diff.
+add lives in BlockedEncoding in both kernels, so its convert cost cancels in the A-B diff.
 
 HBM is hoisted out of the chain loop in both kernels so per-iter time reflects compute +
 register-resident layout converts only — not memory latency.
@@ -230,14 +230,13 @@ def main(M=128, K=4, N=8, N2=4, CHAIN=8, NUM_CTAS=2048, dtype=torch.float64):
     print()
     print(f"Per-CTA M={M}  K={K}  N={N}  N2={N2}  CHAIN={CHAIN}  NUM_CTAS={NUM_CTAS}  dtype={dtype}")
     print()
-    print(f"{'Kernel':<28} {'us':>8}  {'TFLOPS':>8}  {'#convert_layout':>16}  {'rel_err':>10}")
+    print(f"{'Kernel':<28} {'us':>8}  {'#convert_layout':>16}  {'rel_err':>10}")
     print("-" * 80)
-    for name, ms, fl, cl, err in [
-        ("A: chain w/ bcast-mul-add  ", ms_A, flops_A, cl_A, err_A),
-        ("B: chain (no add) baseline ", ms_B, flops_B, cl_B, err_B),
+    for name, ms, cl, err in [
+        ("A: chain w/ bcast-mul-add  ", ms_A, cl_A, err_A),
+        ("B: chain (no add) baseline ", ms_B, cl_B, err_B),
     ]:
-        tflops = fl / (ms * 1e-3) / 1e12
-        print(f"{name:<28} {ms*1000:8.1f}  {tflops:8.3f}  {cl:>16d}  {err:10.2e}")
+        print(f"{name:<28} {ms*1000:8.1f}  {cl:>16d}  {err:10.2e}")
     print()
     print("A − B  = per-iter MMA→Blocked convert cost × CHAIN (HBM matched, scaffold matched).")
     print(f"  Δus           = {(ms_A - ms_B)*1000:.2f}")
@@ -259,8 +258,8 @@ if __name__ == "__main__":
     p.add_argument("-K", type=int, default=4)
     p.add_argument("-N", type=int, default=8)
     p.add_argument("--N2", type=int, default=4)
-    p.add_argument("--chain", type=int, default=16,
-                   help="Default 16 so total runtime stays >100us — past launch-overhead noise.")
+    p.add_argument("--chain", type=int, default=32,
+                   help="Default 32 so total runtime stays >100us — past launch-overhead noise.")
     p.add_argument("--num-ctas", type=int, default=2048)
     args = p.parse_args()
     main(M=args.M, K=args.K, N=args.N, N2=args.N2, CHAIN=args.chain, NUM_CTAS=args.num_ctas)
