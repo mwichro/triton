@@ -43,9 +43,41 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
-// Sanity: a `ttg.convert_layout` with no tt.trans in the upstream slice must
-// be left alone. This is the territory of RemoveLayoutConversions, not this
-// pass.
+// Same idea as above, but the shape-permuting op is `tt.reshape` (with
+// allowReorder), not `tt.trans`. The pass should still fire and eliminate
+// the post-reshape convert.
+
+#blocked_load = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#blocked_reshape = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
+#blocked_store = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [0, 1]}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK: @reshape_eliminates_convert
+  // CHECK-NOT: ttg.convert_layout
+  // CHECK: tt.reshape
+  // CHECK: tt.store
+  tt.func public @reshape_eliminates_convert(%in_ptr: !tt.ptr<f32>, %out_ptr: !tt.ptr<f32>) {
+    %r0 = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #blocked_load>
+    %p_in = tt.splat %in_ptr : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>, #blocked_load>
+    %p_in2 = tt.addptr %p_in, %r0 : tensor<128x!tt.ptr<f32>, #blocked_load>, tensor<128xi32, #blocked_load>
+    %x = tt.load %p_in2 : tensor<128x!tt.ptr<f32>, #blocked_load>
+    %x_r = tt.reshape %x allow_reorder : tensor<128xf32, #blocked_load> -> tensor<8x16xf32, #blocked_reshape>
+    %x_c = ttg.convert_layout %x_r : tensor<8x16xf32, #blocked_reshape> -> tensor<8x16xf32, #blocked_store>
+    %r1 = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32, #ttg.slice<{dim = 0, parent = #blocked_store}>>
+    %r1_2d = tt.expand_dims %r1 {axis = 0 : i32} : tensor<16xi32, #ttg.slice<{dim = 0, parent = #blocked_store}>> -> tensor<1x16xi32, #blocked_store>
+    %off_out = tt.broadcast %r1_2d : tensor<1x16xi32, #blocked_store> -> tensor<8x16xi32, #blocked_store>
+    %p_out = tt.splat %out_ptr : !tt.ptr<f32> -> tensor<8x16x!tt.ptr<f32>, #blocked_store>
+    %p_out2 = tt.addptr %p_out, %off_out : tensor<8x16x!tt.ptr<f32>, #blocked_store>, tensor<8x16xi32, #blocked_store>
+    tt.store %p_out2, %x_c : tensor<8x16x!tt.ptr<f32>, #blocked_store>
+    tt.return
+  }
+}
+
+// -----
+
+// Sanity: a `ttg.convert_layout` with no tt.trans / tt.reshape (reorder) in
+// the upstream slice must be left alone. This is the territory of
+// RemoveLayoutConversions, not this pass.
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>

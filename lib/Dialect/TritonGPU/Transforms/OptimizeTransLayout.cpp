@@ -242,17 +242,26 @@ bool tryOptimizeConvert(ttg::ConvertLayoutOp convertOp) {
   if (slice.empty())
     return false;
 
-  // Require at least one TransOp in the slice; otherwise existing passes
-  // already handle this case (or refuse to for legitimate reasons).
-  bool hasTrans = false;
+  // Require at least one shape-permuting op in the slice (tt.trans, or
+  // tt.reshape with allowReorder). Without one, the convert is in the
+  // territory of RemoveLayoutConversions and we should leave it alone.
+  bool hasShapePermutingOp = false;
   for (Value v : slice) {
-    if (auto *def = v.getDefiningOp())
-      if (isa<tt::TransOp>(def)) {
-        hasTrans = true;
+    Operation *def = v.getDefiningOp();
+    if (!def)
+      continue;
+    if (isa<tt::TransOp>(def)) {
+      hasShapePermutingOp = true;
+      break;
+    }
+    if (auto reshape = dyn_cast<tt::ReshapeOp>(def)) {
+      if (reshape.getAllowReorder()) {
+        hasShapePermutingOp = true;
         break;
       }
+    }
   }
-  if (!hasTrans)
+  if (!hasShapePermutingOp)
     return false;
 
   // Require closed slice: no external users that would need a fix-up convert.
