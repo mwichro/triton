@@ -1307,10 +1307,13 @@ bool cvtNeedsWarpShuffle(RankedTensorType srcTy, RankedTensorType dstTy) {
   MLIRContext *ctx = srcTy.getContext();
   auto kRegister = StringAttr::get(ctx, "register");
   auto kLane = StringAttr::get(ctx, "lane");
+  // transferWithinWarp handles any number of mixed transpositions via the Swap
+  // method, so there is no correctness reason to cap at 2. The Swap method
+  // costs 2*m register selects and ~R shuffles for m transpositions, which is
+  // always preferable to a shared-memory round-trip for register-held data.
   if (to_vector(layout.getOutDimNames()) ==
       SmallVector<StringAttr, 2>{kRegister, kLane}) {
-    auto factors = getWarpLayoutConvertDecomposition(srcTy, dstTy, 32);
-    return (factors.mixedTranspositions.size() < 2);
+    return true;
   }
   return false;
 }
