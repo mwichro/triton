@@ -263,6 +263,23 @@ def TritonGPURemoveLayoutConversions : Pass<"tritongpu-remove-layout-conversions
 
 }
 
+def TritonGPUOptimizeTransLayout : Pass<"tritongpu-optimize-trans-layout", "mlir::ModuleOp"> {
+  let summary = "eliminate shared-memory layout conversions around tt.trans";
+
+  let description = [{
+    Detects `ttg.convert_layout` ops that follow a `tt.trans` (possibly through
+    layout-preserving ops) and would otherwise lower to shared memory. When the
+    upstream slice (load, pointer arithmetic, elementwise ops, the trans
+    itself) can be retyped in place, propagates the target encoding backward
+    through the trans (using `inferTransOpEncoding` with the inverse
+    permutation) so the convert becomes a no-op and is removed.
+  }];
+
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::TritonDialect"];
+}
+
+
 def TritonGPUOptimizeThreadLocality : Pass<"tritongpu-optimize-thread-locality", "mlir::ModuleOp"> {
   let summary = "Reduce the cost of synchronization between threads in an SM";
 
