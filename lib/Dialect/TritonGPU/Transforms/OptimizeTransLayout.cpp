@@ -24,6 +24,7 @@
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Transforms/RegionUtils.h"
+#include "triton/Analysis/AxisInfo.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
@@ -220,10 +221,73 @@ applyRetyping(const llvm::SetVector<Value> &slice,
   return success();
 }
 
+// For a `tt.load` op, return the contiguous run length in the
+// memory-contig dimension under encoding `enc`. The memory-contig dim is
+// determined from the load pointer's axis-info contiguity — the same source
+// of truth used by CoalescePass. Returns 0 if anything goes wrong (e.g.,
+// non-blocked encoding) — callers should treat 0 as "unknown / unsafe".
+int64_t coalescedRunLength(tt::LoadOp loadOp, Attribute enc,
+                           ModuleAxisInfoAnalysis &axisInfo) {
+  auto blocked = dyn_cast<ttg::BlockedEncodingAttr>(enc);
+  if (!blocked)
+    return 0;
+  Value ptr = loadOp.getPtr();
+  auto *info = axisInfo.getAxisInfo(ptr);
+  if (!info)
+    return 0;
+  SmallVector<int64_t> contiguity(info->getContiguity().begin(),
+                                  info->getContiguity().end());
+  SmallVector<unsigned> order = getOrderFromContiguity(contiguity);
+  if (order.empty())
+    return 0;
+  unsigned memContigDim = order[0];
+  if (memContigDim >= blocked.getSizePerThread().size())
+    return 0;
+  return int64_t(blocked.getSizePerThread()[memContigDim]) *
+         int64_t(blocked.getThreadsPerWarp()[memContigDim]);
+}
+
+// Refuse to rewrite if any LoadOp in the slice would end up with a shorter
+// contiguous run in its memory-contig dimension under the new encoding. That
+// shortening means each warp would touch more cache lines per load.
+bool retypingPreservesCoalescing(
+    const llvm::SetVector<Value> &slice,
+    const llvm::DenseMap<Value, Attribute> &layoutMap,
+    ModuleAxisInfoAnalysis &axisInfo) {
+  for (Value v : slice) {
+    Operation *def = v.getDefiningOp();
+    auto loadOp = dyn_cast_or_null<tt::LoadOp>(def);
+    if (!loadOp)
+      continue;
+    auto it = layoutMap.find(v);
+    if (it == layoutMap.end())
+      continue;
+    auto oldRtt = dyn_cast<RankedTensorType>(loadOp.getType());
+    if (!oldRtt)
+      continue;
+    int64_t oldRun =
+        coalescedRunLength(loadOp, oldRtt.getEncoding(), axisInfo);
+    int64_t newRun = coalescedRunLength(loadOp, it->second, axisInfo);
+    if (oldRun == 0 || newRun == 0) {
+      LDBG("coalescing check inconclusive for " << *loadOp
+                                                << "; refusing rewrite");
+      return false;
+    }
+    if (newRun < oldRun) {
+      LDBG("retyping would shorten coalesced run on " << *loadOp << " from "
+                                                      << oldRun << " to "
+                                                      << newRun);
+      return false;
+    }
+  }
+  return true;
+}
+
 // Try to eliminate `convertOp` by propagating its target encoding backward
 // through an intervening `tt.trans` (and any layout-preserving ops) and
 // retyping the upstream slice. Returns true on success.
-bool tryOptimizeConvert(ttg::ConvertLayoutOp convertOp) {
+bool tryOptimizeConvert(ttg::ConvertLayoutOp convertOp,
+                        ModuleAxisInfoAnalysis &axisInfo) {
   // For the slice walker to flip the encoding via the trans, the trans must
   // appear inside the slice. We don't need to find it explicitly here; we
   // simply start the slice walk from the convert's source with the convert's
@@ -268,6 +332,10 @@ bool tryOptimizeConvert(ttg::ConvertLayoutOp convertOp) {
   if (!isSliceClosed(slice, convertOp))
     return false;
 
+  // Don't trade away memory coalescing on any load in the slice.
+  if (!retypingPreservesCoalescing(slice, layoutMap, axisInfo))
+    return false;
+
   LDBG("rewriting convert " << convertOp << " with slice of size "
                             << slice.size());
 
@@ -285,6 +353,7 @@ struct OptimizeTransLayoutPass
     : public impl::TritonGPUOptimizeTransLayoutBase<OptimizeTransLayoutPass> {
   void runOnOperation() override {
     ModuleOp mod = getOperation();
+    ModuleAxisInfoAnalysis axisInfo(mod);
 
     bool changed = true;
     while (changed) {
@@ -295,7 +364,7 @@ struct OptimizeTransLayoutPass
         // The convert may have been erased by a previous iteration's slice.
         if (!cvt || !cvt->getParentOp())
           continue;
-        if (tryOptimizeConvert(cvt))
+        if (tryOptimizeConvert(cvt, axisInfo))
           changed = true;
       }
     }

@@ -4996,6 +4996,43 @@ def test_trans_reshape(device, with_allocator):
     np.testing.assert_equal(to_numpy(expected), to_numpy(actual))
 
 
+# Regression test for the OptimizeTransLayout pass: a small 3D block that gets
+# permuted between load and store. Without the pass, the post-trans
+# ttg.convert_layout lowers to shared memory even though the tensor fits in
+# registers. With the pass, the load layout is propagated through the trans
+# and the convert is removed entirely.
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_permute_eliminates_smem(num_warps, device, with_allocator):
+    if not is_cuda():
+        pytest.skip("OptimizeTransLayout currently wired only for CUDA backend")
+
+    @triton.jit
+    def kernel(in_ptr, out_ptr):
+        d0 = tl.arange(0, 4)
+        d1 = tl.arange(0, 4)
+        d2 = tl.arange(0, 8)
+        offs_in = d0[:, None, None] * 32 + d1[None, :, None] * 8 + d2[None, None, :]
+        x = tl.load(in_ptr + offs_in)
+        x = x + 1.0
+        x_perm = tl.permute(x, (2, 0, 1))
+        y = x_perm * 2.0
+        offs_out = d2[:, None, None] * 16 + d0[None, :, None] * 4 + d1[None, None, :]
+        tl.store(out_ptr + offs_out, y)
+
+    x = torch.randn(128, device=device, dtype=torch.float32)
+    y = torch.zeros(128, device=device, dtype=torch.float32)
+    ref = ((x.view(4, 4, 8) + 1.0).permute(2, 0, 1) * 2.0).contiguous().view(128)
+
+    k = kernel[(1, )](x, y, num_warps=num_warps)
+    torch.testing.assert_close(y, ref)
+
+    # The post-trans convert must be eliminated by OptimizeTransLayout — no
+    # shared-memory bounce in the final PTX.
+    ptx = k.asm['ptx']
+    assert ptx.count('st.shared') == 0, "expected no st.shared after OptimizeTransLayout"
+    assert ptx.count('ld.shared') == 0, "expected no ld.shared after OptimizeTransLayout"
+
+
 # -------------
 # test call
 # -------------
