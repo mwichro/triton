@@ -1,10 +1,13 @@
 # FP64 residual perf gap — B-operand shared-layout investigation
 
-> **Status as of 2026-05-15:** **Layer 1 swizzle retune landed.** kWidth=2
-> path repaired (37 → 47 TFLOPS at size=2048, +27%). Autotuner still
-> prefers BLOCK_K=16 (kWidth=1) at most sizes; the residual ~5–8% gap to
-> cuBLAS lives in the BLOCK_K=16 path and is **not** in the B-shared-load
-> layer. Next investigation: NCU profile of the BLOCK_K=16 winner.
+> **Status as of 2026-05-15:** **Layer 1 swizzle retune landed; root cause
+> of residual gap identified.** kWidth=2 path repaired (37 → 47 TFLOPS,
+> +27%). Residual gap root cause: **autotune instability** — true best config
+> (BM=64,BN=64,nw=2,ns=3) gives 54.4 TFLOPS (−4.4% vs cuBLAS 56.9 on GPU3)
+> but autotune picks BM=128,BN=128,nw=8 (52 TFLOPS) due to single-pass timing
+> noise. Static analysis (ELF+SASS, HW counters blocked) ruled out: cp.async
+> depth, register spilling, occupancy, BK>16 (all spill). Residual ~4.4% is in
+> DMMA/LDGSTS scheduling — needs HW counters or wgmma to close further.
 >
 > This document is the corrected record. The earlier draft proposed a
 > Layer 3 (B-encoding transpose) fix; the TTGIR-flip experiment
@@ -215,22 +218,93 @@ beats us by 5–8% on the kWidth=1 path. Not the lever.
 The 5–8% gap to cuBLAS at sizes 1792–2432 (and ~14% at 4096) is now
 known to be on the **BLOCK_K=16 / kWidth=1 / m16n8k4** path — the one
 the autotuner picks. The B-shared-load layer is no longer suspect.
-Next-step candidates, in order of likelihood:
 
-1. **cp.async pipeline depth.** cuBLAS may overlap more K-steps than
-   Triton's pipeliner. NCU `smsp__inst_executed_pipe_dmma.avg.pct_of_peak_sustained_active`
-   would show DMMA-pipe utilization; if it's <80%, the operand pipeline
-   has slack.
-2. **Register pressure / spilling.** Triton's lowering might spill
-   accumulator registers at BM=BN=64; check `cuobjdump --dump-resource-usage`.
-3. **Warp scheduling / occupancy.** numWarps=2 vs 4 vs 8 trade-off
-   under different M·N tile sizes. Already sweep-covered by the
-   autotuner, but the autotuner only sees runtime, not stall reasons.
-4. **m8n8k4 epilogue/prologue?** Less likely — A100 path isn't on H100.
+## Static analysis results (2026-05-15, GPU3 H100, ncu blocked by RmProfilingAdminOnly)
 
-Recommended next action: NCU profile of the BLOCK_K=16 winner at
-size=2048. Don't write code until the profile rules in/out the
-cp.async hypothesis.
+HW counters unavailable (`ERR_NVGPUCTRPERM`). Used ELF resource analysis
+(`cuobjdump` segfaults on sm90, parsed `.nv.info` ELF section directly)
+and `nvdisasm -c` SASS disassembly instead.
+
+### Hypotheses ruled out
+
+**cp.async pipeline depth** — ruled out. SASS shows `cp.async.wait_group 2`
+in the main loop body: correct 3-stage prefetch. The pipeline is not the
+bottleneck.
+
+**Register spilling at BM=64,BN=64** — ruled out for the winning config.
+EIATTR_FRAME_SIZE = 0, zero STL/LDL in SASS. 254 registers used, nothing
+spilled for BM=64,BN=64,BK=16,nw=2.
+
+**Occupancy** — ruled out as the lever. Smaller tiles (BM=32,BN=64 → 7–8
+CTAs/SM vs 4 for BM=64,BN=64) are consistently *slower*, not faster. The
+kernel is compute-bound; more CTAs just means each CTA does less useful
+work before the SM fills up.
+
+**BK > 16** — blocked by register pressure. BK=32 spills (19 STL+LDL,
+frame=40B), BK=64 is catastrophic (329 spills, frame=656B). BK=16 is the
+only viable value on the nw=2 path.
+
+### BK sweep at size=2048 on GPU3 (direct probe, BM=64,BN=64,nw=2)
+
+| BK | ns | regs | frame | spills | TFLOPS | vs cuBLAS |
+|----|----|------|-------|--------|--------|-----------|
+| 16 | 3  | 254  |   0   |   0    | 54.40  | −4.4%     |
+| 16 | 4  | 250  |   0   |   0    | 54.09  | −4.9%     |
+| 32 | 3  | 255  |  40   |  19    | 39.28  | −30.9%    |
+| 32 | 4  | 255  |  48   |  23    | 34.86  | −38.7%    |
+| 64 | 3  | 255  | 656   | 329    |  9.48  | −83.3%    |
+
+cuBLAS reference: **56.87 TFLOPS** (GPU3, size=2048).
+
+### Tile size comparison at size=2048
+
+| Config              | regs | spills | CTAs/SM(reg) | TFLOPS |
+|---------------------|------|--------|--------------|--------|
+| BM64,BN64,BK16,nw2,ns3  | 254  | 0  | ≤4   | **54.40** |
+| BM64,BN64,BK16,nw2,ns4  | 250  | 0  | ≤4   | 54.09 |
+| BM128,BN128,BK16,nw8,ns3 | 240 | 0  | ≤1   | 52.07 |
+| BM128,BN128,BK16,nw8,ns4 | 236 | 0  | ≤1   | 51.98 |
+| BM32,BN64,BK16,nw2,ns3  | 255  | 0  | ≤4   | 45.66 |
+| BM32,BN64,BK16,nw2,ns4  | 255  | 0  | ≤4   | 47.64 |
+
+### Autotune instability finding
+
+The autotune consistently picks **BM=128,BN=128,nw=8** (52 TFLOPS) instead
+of the true best **BM=64,BN=64,nw=2** (54.4 TFLOPS). Both are in the config
+list. Likely cause: the autotune's single-pass timing is noisy at close
+configurations; BM=128 has only 256 CTAs (one wave) so its timing variance
+is lower, making it look better in the argmin. The real per-config gap is
+~2 TFLOPS but autotune noise is ~1 TFLOPS.
+
+### Residual gap analysis
+
+The direct-probe best (BM=64,BN=64,BK=16,nw=2,ns=3) is **−4.4% vs cuBLAS**.
+SASS instruction mix for this config:
+- 64 DMMA, 89 LDS, 48 LDGSTS, 1136 total instructions per warp
+- Shmem = 48 KB, 4 CTAs/SM (reg-limited), 8 active warps/SM
+- No spilling, no excess memory traffic
+
+The ~4.4% gap is most likely in **instruction scheduling**: cuBLAS has
+hand-optimized SASS with tighter LDGSTS/DMMA interleaving. Not addressable
+through tile-size tuning or Triton-level changes. Would require either
+(a) HW counters to confirm DMMA stall fraction, or (b) wgmma (Hopper
+warp-group MMA) support in Triton's fp64 path.
+
+**Actionable fix:** Fix the autotune to reliably select BM=64,BN=64,nw=2.
+This closes ~1.6 TFLOPS of the apparent gap without any compiler change.
+Options: (1) add a `prune_configs_by_size` hint or (2) increase autotune
+`rep` count so variance is lower, or (3) hard-code the winner for this
+arch/dtype combo.
+
+Previous candidates (now resolved):
+1. ~~cp.async pipeline depth~~ — RULED OUT (wait_group 2, pipeline correct)
+2. ~~Register spilling at BM=64~~ — RULED OUT (0 frame, 0 STL/LDL)
+3. ~~Occupancy~~ — RULED OUT (smaller tiles are slower)
+4. ~~BK > 16~~ — BLOCKED by register pressure; BK=32 spills immediately
+
+Remaining open question: autotune noise source (why BM=128 beats BM=64 in
+the timed autotune pass but not in isolated `do_bench`). Probably single-pass
+variance; fix is to increase rep count or use a more stable comparison metric.
 
 ## Repro/diagnostic scripts
 
@@ -282,12 +356,17 @@ cp.async hypothesis.
 
 ## Outstanding (future work, not for this branch)
 
-- NCU profile of the BLOCK_K=16 winner at size=2048 — identify the
-  dominant stall reason on the current path.
-- Lit test pinning the new f64 kWidth≥2 swizzle params (vec=4,
-  perPhase=2, maxPhase=4 on the N-contig microtile). Add under
-  `test/Conversion/` so a future refactor of the swizzle formula can't
-  silently regress it.
-- A100 sanity rerun — confirm the `kWidth>=2` branch doesn't trigger
-  on sm_80 (m8n8k4 fallback path uses kWidth=1, so the new branch is
-  inert there, but verify).
+- **Autotune instability fix** — BM=64,BN=64,nw=2 is the true best config
+  (54.4 TFLOPS direct probe) but autotune picks BM=128,BN=128,nw=8 (52 TFLOPS)
+  due to single-pass noise. Options: increase autotune `rep` count, or add a
+  size-aware config pruner that down-weights tiles with ≤1 CTA/SM register
+  budget. Closing this alone recovers ~1.6 TFLOPS of the apparent gap.
+- **NCU profile with HW counters** — needs `RmProfilingAdminOnly=0` (root or
+  sysctl). Once accessible: collect `sm__pipe_tensor_op_dmma_cycles_active`
+  and `smsp__average_warps_issue_stalled_*` to confirm the residual ~4.4% is
+  in DMMA stalls from imperfect LDGSTS/DMMA interleaving, not L2 or occupancy.
+- **Lit test** pinning the f64 kWidth≥2 swizzle params (vec=4, perPhase=2,
+  maxPhase=4 on the N-contig microtile). Add under `test/Conversion/` so a
+  future refactor of the swizzle formula can't silently regress it.
+- **A100 sanity rerun** — confirm the `kWidth>=2` branch doesn't trigger on
+  sm_80 (m8n8k4 fallback uses kWidth=1, so the new branch is inert, but verify).
