@@ -174,12 +174,25 @@ When vec=2, elements are swizzled in pairs of 2.  In other words, the element at
         assert(opIdx == 0 || opIdx == 1);
         int rank = order.size();
         int kDim = opIdx == 0 ? rank-1 : rank-2;
-        if (order[0] != kDim)
+        // For f64 with kWidth>=2 (m16n8k8/k16), the N-contig swap inflates vec
+        // from 4 to 8 which collapses maxPhase to 2 and causes bank conflicts
+        // in the m16n8k8 B-operand load (sweep showed ~+29% by skipping it).
+        // Keep the swap for all other dtypes/widths.
+        bool skipNContigSwap = (bitwidth == 64 && kWidth >= 2);
+        if (order[0] != kDim && !skipNContigSwap)
           std::swap(vec, mmaStride);
+        // f64 N-contig microtile (B at kWidth>=2): pack 2 rows per phase to
+        // line up the swizzle period with the 32-bank cycle.
+        if (skipNContigSwap && order[0] != kDim)
+          perPhase = std::max(perPhase, 2);
         // Count how many vec elements are needed to cover all the banks
         int maxPhase = std::max(std::min<int>(mmaStride, 1024 / (vec * bitwidth)), 1);
-        // Account for the row packing from perPhase: mmaStride / perPhase
-        maxPhase = std::max(maxPhase / perPhase, 1);
+        // Account for the row packing from perPhase: mmaStride / perPhase.
+        // For the f64 N-contig microtile we explicitly bumped perPhase above,
+        // but the maxPhase derivation already accounts for it via vec/mmaStride,
+        // so don't divide again — would collapse maxPhase back to 2.
+        if (!skipNContigSwap || order[0] == kDim)
+          maxPhase = std::max(maxPhase / perPhase, 1);
         return get(context, vec, perPhase, maxPhase, order, CGALayout);
     }]>,
 
