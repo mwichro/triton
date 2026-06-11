@@ -172,8 +172,20 @@ When vec=2, elements are swizzled in pairs of 2.  In other words, the element at
         assert(opIdx == 0 || opIdx == 1);
         int rank = order.size();
         int kDim = opIdx == 0 ? rank-1 : rank-2;
-        if (order[0] != kDim)
+        if (order[0] != kDim) {
           std::swap(vec, mmaStride);
+          // FP64 m16n8k{8,16} (kWidth>=2), N-contiguous operand: the fragment
+          // elements a thread loads are K-adjacent, i.e. a full row apart in
+          // shared memory, so the load is scalar (8B) regardless of vec. A
+          // 32B swizzle unit (vec=4) then leaves only 4 phases and the loads
+          // of the 8 rows accessed together conflict pairwise (measured 16.8M
+          // smem-load bank conflicts at BM64/BN64/BK32). A 16B unit (vec=2)
+          // gives all 8 phases and eliminates them (measured 40K), while still
+          // matching the 16B cp.async store granularity. Validated empirically
+          // at kWidth=2 on H100; no-op for kWidth=1 paths via the guard.
+          if (bitwidth == 64 && kWidth >= 2)
+            vec = 128 / bitwidth;
+        }
         // Count how many vec elements are needed to cover all the banks
         int maxPhase = std::max(std::min<int>(mmaStride, 1024 / (vec * bitwidth)), 1);
         // Account for the row packing from perPhase: mmaStride / perPhase
