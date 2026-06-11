@@ -487,6 +487,46 @@ LogicalResult Prefetcher::initialize() {
     // Skip prefetching if kSize is less than prefetchWidth
     if (kSize < prefetchWidth)
       continue;
+
+    // Prefetching keeps up to three K-slices of each operand live at once
+    // (current head, remainder, and the next iteration's head carried through
+    // the loop). If the accumulator plus that operand footprint cannot fit in
+    // the 255-register budget, ptxas spills and the rewrite is a net loss
+    // (measured on H100 fp64: 64x64/nw2 goes 54.4 -> 51.0 TFLOPS with 18
+    // spills, while 128x128 tiles collapse to 6 TFLOPS with 638 spills).
+    // Estimate the footprint in 32-bit registers and skip when over budget.
+    // Calibrated for rank-2 dots; batched (rank-3) dots are left untouched.
+    if (aType.getRank() == 2) {
+      auto regsForElems = [](unsigned elems, Type elemTy) -> unsigned {
+        unsigned bits = elemTy.getIntOrFloatBitWidth();
+        return (elems * bits + 31) / 32;
+      };
+      // A slice: (M x prefetchWidth); B slice: (prefetchWidth x N).
+      SmallVector<int64_t> aShape{aType.getShape().begin(),
+                                  aType.getShape().end()};
+      aShape[aShape.size() - 1] = prefetchWidth;
+      SmallVector<int64_t> bShape{bType.getShape().begin(),
+                                  bType.getShape().end()};
+      bShape[bShape.size() - 2] = prefetchWidth;
+      unsigned accRegs =
+          regsForElems(getTotalElemsPerThread(dot.getType()),
+                       dot.getType().getElementType());
+      unsigned sliceRegs = regsForElems(getTotalElemsPerThread(aEnc, aShape),
+                                        aType.getElementType()) +
+                           regsForElems(getTotalElemsPerThread(bEnc, bShape),
+                                        bType.getElementType());
+      // Empirical threshold (H100 fp64 sweep): estimate 256 (64x64/nw4 k8,
+      // 12 spills) is still a net win, estimate 272 (64x64/nw2 k4, 18 spills)
+      // is a clear loss, larger estimates spill catastrophically.
+      constexpr unsigned kRegFootprintLimit = 260;
+      if (accRegs + 3 * sliceRegs > kRegFootprintLimit) {
+        LDBG("skip prefetch: estimated register footprint "
+             << accRegs << " + 3*" << sliceRegs << " exceeds "
+             << kRegFootprintLimit);
+        continue;
+      }
+    }
+
     auto aVals = getPrefetchSrc(dot.getA());
     auto bVals = getPrefetchSrc(dot.getB());
 

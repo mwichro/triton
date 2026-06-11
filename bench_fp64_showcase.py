@@ -220,6 +220,22 @@ if __name__ == "__main__":
 
 
 """
+RESULTS with swizzle fix + prefetch-on-sm90 + pressure gate (2026-06-11 night):
+  size   cuBLAS     pow2    split  gap(med)  best config
+------------------------------------------------------------------------------
+  1024    47.76    49.24    34.15     -2.9%  BM64 BN32 nw2 ns4     <- Triton wins
+  1280    43.39    42.02    33.14     +3.3%  BM64 BN128 nw4 ns3
+  1536    50.65    46.63    47.31     +6.4%  BM96(64+32) BN64 nw4 ns4
+  1792    56.43    51.21    41.56     +9.5%  BM64 BN64 nw2 ns4
+  2048    56.88    55.13    46.37     +1.2%  BM64 BN128 nw4 ns4
+  2304    55.76    51.01    52.01     +5.9%  BM80(64+16) BN64 nw2 ns3
+  2560    52.14    49.42    50.90     +0.4%  BM80(64+16) BN64 nw2 ns3
+  3072    54.84    50.39    48.81     +8.2%  BM64 BN128 nw4 ns3
+  3584    55.21    54.29    49.44     +2.0%  BM64 BN128 nw4 ns3
+  4096    54.33    53.71    49.45     -0.1%  BM64 BN128 nw4 ns3    <- tie
+Median +2.7%; Triton wins outright at 1024 (prefetch fires on the small
+low-pressure tile) and ties 4096. Residual >5%: 1536/1792/2304/3072.
+
 RESULTS two-kernel run (2026-06-11 H100, paired rounds, median gap):
   size   cuBLAS     pow2    split  gap(med)  best config
 ------------------------------------------------------------------------------
