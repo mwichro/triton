@@ -25,19 +25,20 @@ lowerLocalScGt(Location loc, MLIRContext *ctx, MemDescType memDescTy,
                const TargetInfoBase &targetInfo) {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   bool isScatter = !storeVals.empty();
-  SmallVector<Value> ptrs = computeLocalPtrs(
+  SmallVector<LocalSharedMemoryAddress> addrs = computeLocalAddrs(
       loc, memDescTy, smemObj, llvmElemTy, idxValues, coords, axis, rewriter);
 
   SmallVector<Value> results;
   if (!isScatter)
     results.resize(coords.size());
 
-  for (auto [i, ptr] : llvm::enumerate(ptrs)) {
+  for (auto [i, addr] : llvm::enumerate(addrs)) {
     if (isScatter) {
-      targetInfo.storeShared(rewriter, loc, ptr, storeVals[i], b.true_val());
+      targetInfo.storeDShared(rewriter, loc, addr.ptr, addr.ctaId, storeVals[i],
+                              b.true_val());
     } else {
-      results[i] =
-          targetInfo.loadShared(rewriter, loc, ptr, llvmElemTy, b.true_val());
+      results[i] = targetInfo.loadDShared(rewriter, loc, addr.ptr, addr.ctaId,
+                                          llvmElemTy, b.true_val());
     }
   }
 
@@ -59,11 +60,6 @@ LogicalResult lowerLocalStore(Location loc, MLIRContext *ctx, Value regVal,
                           : toLinearLayout(memDescTy);
   auto cvt = regLayout.invertAndCompose(sharedLayout);
 
-  auto kBlock = str_attr("block");
-  // We could support it by removing this check if we ever want to
-  if (!cvt.isTrivialOver({kBlock})) {
-    return failure();
-  }
   lowerLocalLdSt(loc, ctx, cvt, inVals, llvmElemTy, memDescTy, smemObj,
                  rewriter, targetInfo);
 
@@ -190,12 +186,6 @@ public:
                             ? paddedLinearLayout(memDescTy)
                             : toLinearLayout(memDescTy);
     auto cvt = regLayout.invertAndCompose(sharedLayout);
-
-    auto kBlock = str_attr("block");
-    // We could support it by removing this check if we ever want to
-    if (!cvt.isTrivialOver({kBlock})) {
-      return failure();
-    }
 
     auto outVals = lowerLocalLdSt(loc, ctx, cvt, {}, llvmElemTy, memDescTy,
                                   smemObj, rewriter, targetInfo, op);

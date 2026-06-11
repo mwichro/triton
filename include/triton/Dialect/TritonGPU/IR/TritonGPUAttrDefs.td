@@ -162,37 +162,22 @@ When vec=2, elements are swizzled in pairs of 2.  In other words, the element at
         // This packs a few rows together for small K
         int perPhase = std::max<int>(1024 / (bitwidth * K), 1);
 
-        int mmaStride = 8;
-        // Cap vec to fit within one bank cycle (32 bytes) for wide types.
-        // For f64 (bitwidth=64) with kWidth=4: uncapped vec=16 → vec*bitwidth=1024
-        // → maxPhase=1 (no swizzle, bank conflicts). Capping at 256/bitwidth
-        // elements keeps maxPhase ≥ 4 for all dtypes.
-        int vec = std::min((int)(4 * kWidth), std::max(256 / (int)bitwidth, 1));
+        // FP64 MMAv2 uses an m8n8k4 tile rather than the m16n8 tile used by
+        // the other MMAv2 variants.
+        int mmaStride = bitwidth == 64 ? 4 : 8;
+        int vec = 4 * kWidth;
         // needsTrans is equiv. to flipping the opIdx
         if (needTrans)
           std::swap(vec, mmaStride);
         assert(opIdx == 0 || opIdx == 1);
         int rank = order.size();
         int kDim = opIdx == 0 ? rank-1 : rank-2;
-        // For f64 with kWidth>=2 (m16n8k8/k16), the N-contig swap inflates vec
-        // from 4 to 8 which collapses maxPhase to 2 and causes bank conflicts
-        // in the m16n8k8 B-operand load (sweep showed ~+29% by skipping it).
-        // Keep the swap for all other dtypes/widths.
-        bool skipNContigSwap = (bitwidth == 64 && kWidth >= 2);
-        if (order[0] != kDim && !skipNContigSwap)
+        if (order[0] != kDim)
           std::swap(vec, mmaStride);
-        // f64 N-contig microtile (B at kWidth>=2): pack 2 rows per phase to
-        // line up the swizzle period with the 32-bank cycle.
-        if (skipNContigSwap && order[0] != kDim)
-          perPhase = std::max(perPhase, 2);
         // Count how many vec elements are needed to cover all the banks
         int maxPhase = std::max(std::min<int>(mmaStride, 1024 / (vec * bitwidth)), 1);
-        // Account for the row packing from perPhase: mmaStride / perPhase.
-        // For the f64 N-contig microtile we explicitly bumped perPhase above,
-        // but the maxPhase derivation already accounts for it via vec/mmaStride,
-        // so don't divide again — would collapse maxPhase back to 2.
-        if (!skipNContigSwap || order[0] == kDim)
-          maxPhase = std::max(maxPhase / perPhase, 1);
+        // Account for the row packing from perPhase: mmaStride / perPhase
+        maxPhase = std::max(maxPhase / perPhase, 1);
         return get(context, vec, perPhase, maxPhase, order, CGALayout);
     }]>,
 
