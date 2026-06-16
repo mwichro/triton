@@ -27,6 +27,7 @@ import torch
 import triton
 import triton.language as tl
 import triton.testing
+from time import sleep
 
 DEVICE = "cuda"
 ROUNDS = 5          # paired head-to-head rounds per size
@@ -183,13 +184,14 @@ def bench_size(size):
     split_finalists = screen(make_split(*cfg) for cfg in SPLIT_CONFIGS)
 
     # Paired head-to-head: cuBLAS + finalists of both families, back-to-back
-    # per round so clock drift hits everyone equally.
+    # per round so clock drift hits everyone equally. The first measurement of
+    # a round sits in the most favorable clock/thermal slot, so alternate
+    # whether cuBLAS goes first or last to average out the ordering bias.
     cublas = lambda: torch.matmul(a, b)
     gaps, cu_best = [], 0.0
     best = {"pow2": (0.0, "-"), "split": (0.0, "-")}
-    for _ in range(ROUNDS):
-        cu = tf(triton.testing.do_bench(cublas, quantiles=[0.5]))
-        cu_best = max(cu_best, cu)
+
+    def bench_triton_finalists():
         round_best = 0.0
         for family, finalists in (("pow2", pow2_finalists), ("split", split_finalists)):
             for _, launch, label in finalists:
@@ -197,6 +199,18 @@ def bench_size(size):
                 round_best = max(round_best, t)
                 if t > best[family][0]:
                     best[family] = (t, label)
+        return round_best
+
+    for rnd in range(ROUNDS):
+        if rnd % 2 == 0:
+            cu = tf(triton.testing.do_bench(cublas, quantiles=[0.5]))
+            sleep(0.5)  # let the boost noise settle before the next measurement
+            round_best = bench_triton_finalists()
+        else:
+            sleep(0.5)  # let the boost noise settle before the next measurement
+            round_best = bench_triton_finalists()
+            cu = tf(triton.testing.do_bench(cublas, quantiles=[0.5]))
+        cu_best = max(cu_best, cu)
         gaps.append(100 * (cu - round_best) / cu)
     gaps.sort()
     med_gap = gaps[len(gaps) // 2]
